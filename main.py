@@ -7,6 +7,12 @@ Nurses and doctors now have their own step() methods and decide their behavior b
 time blocks and assignments. The model coordinates the environment and event logging,
 but agents drive most contact generation.
 
+MULTI-DAY EXTENSION:
+- 30-day simulation
+- dynamic admissions/discharges
+- fixed baseline staffing
+- no infection dynamics yet
+
 Outputs:
 - outputs/visit_log.csv
 - outputs/aggregated_edges.csv
@@ -17,7 +23,7 @@ Outputs:
 """
 
 # =========================================================
-# 1) IMPORTS & CONSTANTS: Libraries and simulation parameters
+# 1) IMPORTS & CONSTANTS
 # =========================================================
 
 import argparse
@@ -25,7 +31,7 @@ import json
 import math
 import os
 import random
-from collections import Counter, defaultdict
+from collections import Counter
 from dataclasses import dataclass
 from datetime import datetime
 
@@ -35,98 +41,93 @@ import pandas as pd
 from mesa import Agent, Model
 
 
-# Simulation parameters
 DEFAULT_SEED = 42
-DEFAULT_DT_MIN = 5  # Time interval per tick in minutes
+DEFAULT_DT_MIN = 5
 MINUTES_PER_DAY = 24 * 60
-TICKS_PER_DAY = MINUTES_PER_DAY // DEFAULT_DT_MIN  # Total ticks in a 24-hour day (288)
+TICKS_PER_DAY = MINUTES_PER_DAY // DEFAULT_DT_MIN
 
-N_PATIENTS = 50
-N_NURSES = 10
-N_DOCTORS = 5
-N_ROOMS = 13
-DURATION_MIN_DEFAULT = 5  # Default duration of any contact event
+# 83-bed ward:
+# 1x1-bed, 5x2-bed, 18x4-bed = 83 beds total
+ROOM_CAPACITY_SPEC = [1, 2, 2, 2, 2, 2] + [4] * 18
+N_PATIENTS = sum(ROOM_CAPACITY_SPEC)  # 83
+N_ROOMS = len(ROOM_CAPACITY_SPEC)     # 24
 
-# Room capacity specification (beds per room):
-# room_0, room_1 => 2 beds each
-# room_2 to room_11 => 4 beds each
-# room_12 => 6 beds
-# Total: 2*2 + 10*4 + 6 = 50 beds (matching N_PATIENTS)
-ROOM_CAPACITY_SPEC = [2, 2] + [4] * 10 + [6]
+# Fixed baseline staffing
+N_NURSES = 7
+N_DOCTORS = 4
 
-# Scheduled care activity time blocks [start_minute, end_minute), local daytime:
-DOCTOR_BLOCKS = [(7 * 60, 8 * 60), (15 * 60, 16 * 60)]  # 7-8 AM, 3-4 PM
-NURSE_ROUNDS_BLOCKS = [(6 * 60, 7 * 60), (16 * 60, 17 * 60)]  # 6-7 AM, 4-5 PM
-FEEDING_BLOCKS = [(8 * 60, 9 * 60), (12 * 60, 13 * 60), (18 * 60, 19 * 60)]  # 8-9 AM, 12-1 PM, 6-7 PM
-AD_HOC_BLOCK = (9 * 60, 15 * 60)  # Daytime window for random interactions (9 AM - 3 PM)
-HANDOVER_BLOCKS = [(6 * 60 + 55, 7 * 60 + 5), (15 * 60 + 55, 16 * 60 + 5)]  # Shift handover windows
+DURATION_MIN_DEFAULT = 5
+
+# Scheduled care activity time blocks [start_minute, end_minute)
+DOCTOR_BLOCKS = [(9 * 60, 10 * 60)]  # one doctor round per day
+NURSE_ROUNDS_BLOCKS = [(6 * 60, 7 * 60), (12 * 60, 13 * 60), (16 * 60, 17 * 60)]  # 3 rounds/day
+FEEDING_BLOCKS = [(8 * 60, 9 * 60), (12 * 60, 13 * 60), (18 * 60, 19 * 60)]
+AD_HOC_BLOCK = (9 * 60, 15 * 60)
+HANDOVER_BLOCKS = [(6 * 60 + 55, 7 * 60 + 5), (18 * 60 + 55, 19 * 60 + 5)]
 
 
 # =========================================================
-# 2) PARAMETERS & CONFIGURATION: SimConfig dataclass
+# 2) PARAMETERS & CONFIGURATION
 # =========================================================
 @dataclass
+@dataclass
 class SimConfig:
-    """
-    Simulation configuration container.
-    
-    Attributes:
-        seed: Random seed for reproducibility
-        run_id: Unique identifier for this simulation run
-        dt_min: Time interval in minutes for each tick
-        ticks_per_day: Number of ticks in a 24-hour cycle
-        n_patients, n_nurses, n_doctors, n_rooms: Agent and room counts
-        feeding_coverage_min/max: Range for patient feeding coverage
-        p_ad_hoc_tick: Probability of ad-hoc contact event per tick
-        p_roommate_event_per_room_per_hour: Probability of roommate interaction
-        output_dir: Directory for output files
-    """
     seed: int = DEFAULT_SEED
     run_id: str = ""
 
     dt_min: int = DEFAULT_DT_MIN
     ticks_per_day: int = TICKS_PER_DAY
+    simulation_days: int = 30
 
+    ward_capacity: int = N_PATIENTS
     n_patients: int = N_PATIENTS
     n_nurses: int = N_NURSES
     n_doctors: int = N_DOCTORS
     n_rooms: int = N_ROOMS
 
-    feeding_coverage_min: float = 0.60
-    feeding_coverage_max: float = 0.80
+    target_bed_occupancy: float = 0.6829
+    mean_los_days: float = 7.69
+    initial_patient_count: int = 57
+    daily_admissions_mean: float = 7.37
+    los_distribution: str = "fixed"
+    initial_remaining_los_distribution: str = "discrete_uniform_1_8"
 
+    baseline_nurses_day: int = 7
+    baseline_nurses_night: int = 5
+    baseline_doctors_day: int = 4
+    baseline_doctors_night: int = 1
+
+    shift_length_hours: int = 12
+    nurse_shift_times: str = "07:00-19:00"
+    doctor_shift_times: str = "08:00-17:00"
+
+    nurse_rounds_per_day: int = 3
+    doctor_visits_per_patient_per_day: int = 1
+
+    day_activity_share: float = 0.941
+    night_activity_share: float = 0.059
+
+    mean_nurse_patient_contact_duration_min: int = 10
+    mean_doctor_patient_contact_duration_min: int = 4
+    contact_duration_distribution: str = "exponential"
+
+    admission_room_assignment_rule: str = "first_available_bed"
+    day_boundary_rule: str = "decrement_los_then_discharge_then_admit_then_refresh_assignments"
+
+    feeding_coverage_min: float = 0.30
+    feeding_coverage_max: float = 0.50
     p_ad_hoc_tick: float = 0.20
     ad_hoc_max_events_per_tick: int = 2
-
     p_roommate_event_per_room_per_hour: float = 0.10
-
     nurse_station_random_ticks_per_day: int = 10
 
     output_dir: str = "outputs"
 
 
 # =========================================================
-# 3) TIME UTILITIES: Tick-to-time conversions and time block checks
+# 3) TIME UTILITIES
 # =========================================================
 def build_run_output_dir(base_output_dir: str, run_id: str, seed: int) -> str:
-    """Build a unique run-specific output directory path.
-    
-    Creates a directory name that includes a human-readable timestamp, seed, and run_id
-    to ensure each simulation run has its own isolated output folder and previous
-    results are never overwritten. This allows running multiple simulations without
-    losing any results to accidental overwrites.
-    
-    Folder naming convention: YYYYMMDD_HHMMSS_seedN_<run_id>
-    Example: outputs/20260307_141530_seed42_my_experiment
-    
-    Args:
-        base_output_dir: Base output directory (e.g., "outputs")
-        run_id: Unique identifier for this run (user-provided or timestamp-based)
-        seed: Random seed value for reproducibility
-    
-    Returns:
-        Path to run-specific directory that uniquely identifies this simulation run.
-    """
     now = datetime.now()
     timestamp_str = now.strftime("%Y%m%d_%H%M%S")
     run_dir_name = f"{timestamp_str}_seed{seed}_{run_id}"
@@ -134,30 +135,25 @@ def build_run_output_dir(base_output_dir: str, run_id: str, seed: int) -> str:
 
 
 def tick_to_time_min(tick: int, dt_min: int) -> int:
-    """Convert simulation tick number to minutes since start of day."""
     return tick * dt_min
 
 
 def minutes_to_hhmm(total_minutes: int) -> str:
-    """Convert minutes since start of day to HH:MM format."""
     hh = (total_minutes // 60) % 24
     mm = total_minutes % 60
     return f"{hh:02d}:{mm:02d}"
 
 
 def in_any_block(time_min: int, blocks: list[tuple[int, int]]) -> bool:
-    """Check if time_min falls within any of the given time blocks."""
     return any(start <= time_min < end for start, end in blocks)
 
 
 def in_block(time_min: int, block: tuple[int, int]) -> bool:
-    """Check if time_min falls within the given time block [start, end)."""
     start, end = block
     return start <= time_min < end
 
 
 def block_index(time_min: int, blocks: list[tuple[int, int]]) -> int | None:
-    """Return the index of the block containing time_min, or None if outside all blocks."""
     for idx, (start, end) in enumerate(blocks):
         if start <= time_min < end:
             return idx
@@ -165,10 +161,9 @@ def block_index(time_min: int, blocks: list[tuple[int, int]]) -> int | None:
 
 
 # =========================================================
-# 4) AGENT CLASSES: Patient, Nurse, Doctor, Base
+# 4) AGENT CLASSES
 # =========================================================
 class BaseHospitalAgent(Agent):
-    """Base class for all hospital agents (patients, nurses, doctors)."""
     def __init__(self, model: Model, unique_id: str, agent_type: str):
         super().__init__(model)
         self.unique_id = unique_id
@@ -177,328 +172,235 @@ class BaseHospitalAgent(Agent):
 
 class PatientAgent(BaseHospitalAgent):
     """
-    Patient agent. Assigned to a room and involved in care contact events.
-    
-    Patients remain mostly passive. They may participate in roommate interactions,
-    but these are still model-managed for simplicity.
+    Passive patient agent with multi-day stay attributes.
     """
-    def __init__(self, model: Model, unique_id: str, room_id: str):
+    def __init__(
+        self,
+        model: Model,
+        unique_id: str,
+        room_id: str,
+        admission_day: int | None = None,
+        remaining_los_days: int | None = None,
+        is_active: bool = False,
+    ):
         super().__init__(model, unique_id, "patient")
         self.room_id = room_id
-    
+        self.admission_day = admission_day
+        self.remaining_los_days = remaining_los_days
+        self.is_active = is_active
+
     def step(self):
-        """Patient step: currently passive. Roommate interactions are model-managed."""
+        if not self.is_active:
+            return
         pass
 
 
 class NurseAgent(BaseHospitalAgent):
-    """
-    Nurse agent with explicit state machine and own step() behavior.
-    
-    State machine:
-    - "rounding": Visiting assigned patients during nurse round time blocks.
-    - "feeding": Serving designated patients during feeding blocks (if feeder).
-    - "handover": At nurse station during shift handover times.
-    - "ad_hoc": Occasional unscheduled patient visits during daytime.
-    - "station": At nurse station or doing administrative work.
-    - "idle": Off-duty or between assignments.
-    
-    IMPROVEMENTS: Agents now maintain persistent block-level visit plans that are
-    precomputed at each block start and distributed across ticks with smoothing.
-    Visits are pre-assigned to specific ticks with jitter to eliminate quota-based
-    spikiness and create more realistic temporal distributions.
-    
-    Attributes:
-        caseload_rooms: List of room IDs this nurse is responsible for.
-        is_active_feeder: Whether this nurse is selected as a feeder for the day.
-        current_state: Current state (one of the above).
-        
-        Block planning (persistent per block):
-        round_visits_per_tick: Dict[int, List[str]] mapping tick to patients to visit.
-        round_block_started_at_tick: Tick when current round block plan was created.
-        
-        feeding_visits_per_tick: Dict[int, List[str]] mapping tick to patients to feed.
-        feeding_block_started_at_tick: Tick when current feeding block plan was created.
-        
-        handover_block_idx: Index of the current handover block (-1 if not in one).
-        handover_initiated_this_block: Whether initiated contact in current block.
-    """
     def __init__(self, model: Model, unique_id: str):
         super().__init__(model, unique_id, "nurse")
-        self.caseload_rooms: list[str] = []  # List of room IDs this nurse is responsible for
-        self.is_active_feeder: bool = False  # Whether this nurse participates in feeding
-        
-        # State machine
+        self.caseload_rooms: list[str] = []
+        self.is_active_feeder: bool = False
+
         self.current_state: str = "idle"
-        
-        # Block-level persistent visit plans (tick -> list of patients)
-        self.round_visits_per_tick: dict[int, list[str]] = {}  # Pre-assigned visits per tick
-        self.round_block_started_at_tick: int = -1  # When current plan was created
-        
-        self.feeding_visits_per_tick: dict[int, list[str]] = {}  # Pre-assigned feedings per tick
-        self.feeding_block_started_at_tick: int = -1  # When current plan was created
-        
-        # Handover state (track block to reset properly)
-        self.handover_block_idx: int = -1  # Current handover block index
+
+        self.round_visits_per_tick: dict[int, list[str]] = {}
+        self.round_block_started_at_tick: int = -1
+
+        self.feeding_visits_per_tick: dict[int, list[str]] = {}
+        self.feeding_block_started_at_tick: int = -1
+
+        self.handover_block_idx: int = -1
         self.handover_initiated_this_block: bool = False
-    
+
     def step(self):
-        """Execute one tick of nurse behavior based on current time and state."""
         time_min = self.model.get_current_time_min()
         tick = self.model.current_tick
-        
-        # Determine what state we should be in based on current time
+
         self.current_state = self._get_current_state(time_min)
-        
-        # Execute behavior appropriate to current state
+
+        def _is_active_patient(pid: str) -> bool:
+            p = self.model.agent_index.get(pid)
+            return (p is not None) and getattr(p, "is_active", False) is True
+
         if self.current_state == "rounding":
+            if tick in self.round_visits_per_tick:
+                self.round_visits_per_tick[tick] = [
+                    pid for pid in self.round_visits_per_tick[tick] if _is_active_patient(pid)
+                ]
             self._handle_rounding(tick, time_min)
+
         elif self.current_state == "feeding":
+            if tick in self.feeding_visits_per_tick:
+                self.feeding_visits_per_tick[tick] = [
+                    pid for pid in self.feeding_visits_per_tick[tick] if _is_active_patient(pid)
+                ]
             self._handle_feeding(tick, time_min)
+
         elif self.current_state == "handover":
             self._handle_handover(tick, time_min)
+
         elif self.current_state == "ad_hoc":
-            self._handle_ad_hoc(tick, time_min)
-        # station and idle states don't generate proactive contacts
-    
+            has_active = False
+            for rid in self.caseload_rooms:
+                for pid in self.model.get_patients_in_room(rid):
+                    if _is_active_patient(pid):
+                        has_active = True
+                        break
+                if has_active:
+                    break
+            if has_active:
+                self._handle_ad_hoc(tick, time_min)
+
     def _get_current_state(self, time_min: int) -> str:
-        """Determine the nurse's current state based on time of day.
-        
-        Priority order: handover > feeding > rounding > ad_hoc > station/idle
-        """
-        # Check handover first
         if in_any_block(time_min, HANDOVER_BLOCKS):
             return "handover"
-        
-        # Check if in feeding block and this nurse is a feeder
         if self.is_active_feeder and in_any_block(time_min, FEEDING_BLOCKS):
             return "feeding"
-        
-        # Check nurse round blocks
         if in_any_block(time_min, NURSE_ROUNDS_BLOCKS):
             return "rounding"
-        
-        # Check ad hoc window
         if in_block(time_min, AD_HOC_BLOCK):
             return "ad_hoc"
-        
-        # Default to station/idle
         return "station"
-    
+
     def prepare_round_block(self, tick: int, time_min: int):
-        """Prepare the nurse's visit plan for entering a new nurse round block.
-        
-        Distributes all patients in the caseload across ticks within the block.
-        Uses proportional allocation with jitter to spread visits smoothly and
-        avoid artificial spikes. Ensures all patients are visited exactly once.
-        
-        Called once when entering a new NURSE_ROUNDS_BLOCKS period.
-        """
         bidx = block_index(time_min, NURSE_ROUNDS_BLOCKS)
         if bidx is None:
             return
-        
-        # Only prepare if not already prepared for this block
         if self.round_block_started_at_tick == tick:
             return
-        
-        # Gather all patients in caseload and shuffle
+
         caseload_patients = []
         for rid in self.caseload_rooms:
             caseload_patients.extend(self.model.get_patients_in_room(rid))
         self.model.rng.shuffle(caseload_patients)
-        
-        # Distribute patients across ticks with proportional + jitter allocation
+
         block_start_tick = NURSE_ROUNDS_BLOCKS[bidx][0] // self.model.config.dt_min
         block_end_tick = NURSE_ROUNDS_BLOCKS[bidx][1] // self.model.config.dt_min
-        
+
         self.round_visits_per_tick = {}
         remaining_patients = list(caseload_patients)
-        
+
         for current_tick in range(block_start_tick, block_end_tick):
             ticks_left = block_end_tick - current_tick
             patients_left = len(remaining_patients)
-            
+
             if patients_left == 0:
                 break
-            
-            # Greedy allocation: ensure all visits complete by block end
+
             n_to_visit = max(1, math.ceil(patients_left / ticks_left))
-            # Add small jitter (-1, 0, or +1) to reduce determinism
             jitter = self.model.rng.randint(-1, 2)
             n_to_visit = max(1, min(n_to_visit + jitter, patients_left))
-            
-            # Randomly select patients for this tick
+
             visits_this_tick = self.model.rng.sample(remaining_patients, k=n_to_visit)
             self.round_visits_per_tick[current_tick] = visits_this_tick
-            
-            # Remove assigned patients from remaining
+
             for pid in visits_this_tick:
                 remaining_patients.remove(pid)
-        
+
         self.round_block_started_at_tick = tick
-    
+
     def prepare_feeding_block(self, tick: int, time_min: int):
-        """Prepare the nursing feeding visit plan for entering a new feeding block.
-        
-        Only called if this nurse is an active feeder. Gets assignment from model
-        and distributes across ticks with proportional + jitter allocation.
-        
-        Called once when entering a new FEEDING_BLOCKS period (if feeder).
-        """
         if not self.is_active_feeder:
             return
-        
+
         bidx = block_index(time_min, FEEDING_BLOCKS)
         if bidx is None:
             return
-        
-        # Only prepare if not already prepared for this block
         if self.feeding_block_started_at_tick == tick:
             return
-        
-        # Get assignment from model (which caches and distributes across feeders)
+
         assigned = self.model.get_feeding_assignment_for_nurse(self.unique_id, bidx)
         self.model.rng.shuffle(assigned)
-        
-        # Distribute feedings across ticks with proportional + jitter allocation
+
         block_start_tick = FEEDING_BLOCKS[bidx][0] // self.model.config.dt_min
         block_end_tick = FEEDING_BLOCKS[bidx][1] // self.model.config.dt_min
-        
+
         self.feeding_visits_per_tick = {}
         remaining_patients = list(assigned)
-        
+
         for current_tick in range(block_start_tick, block_end_tick):
             ticks_left = block_end_tick - current_tick
             patients_left = len(remaining_patients)
-            
+
             if patients_left == 0:
                 break
-            
-            # Greedy allocation: ensure all feedings complete by block end
+
             n_to_feed = max(1, math.ceil(patients_left / ticks_left))
-            # Add small jitter
             jitter = self.model.rng.randint(-1, 2)
             n_to_feed = max(1, min(n_to_feed + jitter, patients_left))
-            
-            # Randomly select patients for this tick
+
             feedings_this_tick = self.model.rng.sample(remaining_patients, k=n_to_feed)
             self.feeding_visits_per_tick[current_tick] = feedings_this_tick
-            
-            # Remove assigned patients from remaining
+
             for pid in feedings_this_tick:
                 remaining_patients.remove(pid)
-        
+
         self.feeding_block_started_at_tick = tick
-    
+
     def _handle_rounding(self, tick: int, time_min: int):
-        """Handle nurse round visits during scheduled blocks (6-7 AM, 4-5 PM).
-        
-        Executes visits pre-assigned to this tick from the block's visit plan.
-        Visits are pre-distributed across ticks with jitter to ensure smooth
-        temporal distribution and avoid quota-based spikiness.
-        
-        This approach ensures:
-        - All patients in caseload are visited exactly once per block
-        - Smooth temporal distribution with randomized timing
-        - No artificial spikes from deterministic allocation
-        """
         bidx = block_index(time_min, NURSE_ROUNDS_BLOCKS)
         if bidx is None:
             return
-        
+
         block_start_tick = NURSE_ROUNDS_BLOCKS[bidx][0] // self.model.config.dt_min
-        
-        # Prepare visit plan on first tick of block
         if tick == block_start_tick:
             self.prepare_round_block(tick, time_min)
-        
-        # Execute visits scheduled for this tick (from pre-assigned plan)
+
         if tick in self.round_visits_per_tick:
             for pid in self.round_visits_per_tick[tick]:
-                self.model.record_contact(
-                    tick=tick,
-                    actor_id=self.unique_id,
-                    target_id=pid,
-                    event_type="nurse_round",
-                )
-    
+                if self.model.is_patient_active(pid):
+                    self.model.record_contact(
+                        tick=tick,
+                        actor_id=self.unique_id,
+                        target_id=pid,
+                        event_type="nurse_round",
+                    )
+
     def _handle_feeding(self, tick: int, time_min: int):
-        """Handle feeding duties during scheduled feeding blocks.
-        
-        Only called if this nurse is designated as a feeder. Executes feedings
-        pre-assigned to this tick from the block's feeding plan. Feedings are
-        pre-distributed across ticks with jitter to ensure smooth timing.
-        
-        This approach ensures:
-        - Feeders' workload is realistic (30-50% of patients per block)
-        - No extreme dominance of feeder nodes in network
-        - Smooth temporal distribution with randomized timing
-        """
         if not self.is_active_feeder:
             return
-        
+
         bidx = block_index(time_min, FEEDING_BLOCKS)
         if bidx is None:
             return
-        
+
         block_start_tick = FEEDING_BLOCKS[bidx][0] // self.model.config.dt_min
-        
-        # Prepare feeding plan on first tick of block
         if tick == block_start_tick:
             self.prepare_feeding_block(tick, time_min)
-        
-        # Execute feedings scheduled for this tick (from pre-assigned plan)
+
         if tick in self.feeding_visits_per_tick:
             for pid in self.feeding_visits_per_tick[tick]:
-                self.model.record_contact(
-                    tick=tick,
-                    actor_id=self.unique_id,
-                    target_id=pid,
-                    event_type="feeding",
-                )
-    
+                if self.model.is_patient_active(pid):
+                    self.model.record_contact(
+                        tick=tick,
+                        actor_id=self.unique_id,
+                        target_id=pid,
+                        event_type="feeding",
+                    )
+
     def _handle_handover(self, tick: int, time_min: int):
-        """Handle shift handover interactions at nurse station.
-        
-        During handover periods (6:55-7:05 AM, 3:55-4:05 PM), nurses gather at the station.
-        Nurses probabilistically initiate interactions with each other or doctors.
-        
-        IMPROVED: Now agent-driven instead of purely model-managed.
-        Uses proper block_index() tracking to identify block transitions and reset
-        the initiated flag reliably for both morning and afternoon periods.
-        """
-        # Check if we're in a handover period using proper block indexing
         bidx = block_index(time_min, HANDOVER_BLOCKS)
         if bidx is None:
-            # Left a handover block; reset flag for next block
             if self.handover_block_idx != -1:
                 self.handover_block_idx = -1
                 self.handover_initiated_this_block = False
             return
-        
-        # Entering a new handover block; reset flag
+
         if bidx != self.handover_block_idx:
             self.handover_block_idx = bidx
             self.handover_initiated_this_block = False
-        
-        # Avoid excessive handover interactions per block
-        # Each nurse initiates at most once per handover period
+
         if self.handover_initiated_this_block:
             return
-        
-        # Moderate probability of initiating a handover contact
         if self.model.rng.random() > 0.6:
             return
-        
-        # Nurse can interact with another nurse or a doctor
+
         interactant_option = self.model.rng.choice(["nurse", "doctor"])
-        
+
         if interactant_option == "nurse":
             other_nurses = [n for n in self.model.nurses if n.unique_id != self.unique_id]
             if other_nurses:
                 other = self.model.rng.choice(other_nurses)
-                # Check if we haven't recently contacted this nurse (undirected pair)
                 if not self.model.is_recent_contact(self.unique_id, other.unique_id, tick, window_ticks=5):
                     self.model.record_contact(
                         tick=tick,
@@ -507,10 +409,9 @@ class NurseAgent(BaseHospitalAgent):
                         event_type="nurse_station",
                     )
                     self.handover_initiated_this_block = True
-        else:  # doctor
+        else:
             if self.model.doctors:
                 doctor = self.model.rng.choice(self.model.doctors)
-                # Check if we haven't recently contacted this doctor (undirected pair)
                 if not self.model.is_recent_contact(self.unique_id, doctor.unique_id, tick, window_ticks=5):
                     self.model.record_contact(
                         tick=tick,
@@ -519,28 +420,21 @@ class NurseAgent(BaseHospitalAgent):
                         event_type="nurse_station",
                     )
                     self.handover_initiated_this_block = True
-    
+
     def _handle_ad_hoc(self, tick: int, time_min: int):
-        """Handle occasional unscheduled patient visits during daytime window (9 AM - 3 PM).
-        
-        With low probability, a nurse may initiate a spontaneous visit to a random patient
-        from their caseload. Avoids excessive repeated contacts to the same patient.
-        """
         if not in_block(time_min, AD_HOC_BLOCK):
             return
-        
-        # Low probability of ad-hoc visit initiation
         if self.model.rng.random() > (self.model.config.p_ad_hoc_tick * 0.3):
             return
-        
-        # Pick a random patient from my caseload to visit
+
         if self.caseload_rooms:
             caseload_patients = []
             for rid in self.caseload_rooms:
                 caseload_patients.extend(self.model.get_patients_in_room(rid))
+            caseload_patients = [pid for pid in caseload_patients if self.model.is_patient_active(pid)]
+
             if caseload_patients:
                 pid = self.model.rng.choice(caseload_patients)
-                # Avoid excessive repeated ad-hoc contacts to same patient
                 if not self.model.is_recent_contact(self.unique_id, pid, tick, window_ticks=24):
                     self.model.record_contact(
                         tick=tick,
@@ -551,205 +445,117 @@ class NurseAgent(BaseHospitalAgent):
 
 
 class DoctorAgent(BaseHospitalAgent):
-    """
-    Doctor agent with explicit state machine and own step() behavior.
-    
-    State machine:
-    - "rounding": Visiting assigned patients during doctor round blocks (7-8 AM, 3-4 PM).
-    - "handover": At nurse station during shift handover times.
-    - "ad_hoc": Occasional unscheduled patient visits during daytime.
-    - "station": At doctor's office or nurse station for administrative work.
-    - "idle": Off-duty or between assignments.
-    
-    IMPROVEMENTS: Like NurseAgent, doctors now maintain persistent block-level visit plans
-    that are precomputed at each round block start and distributed across ticks with jitter.
-    This eliminates quota-based spikiness and creates more realistic temporal behavior.
-    
-    Attributes:
-        panel_patients: List of patient IDs this doctor is responsible for.
-        current_state: Current state (one of the above).
-        
-        Block planning (persistent per block):
-        round_visits_per_tick: Dict[int, List[str]] mapping tick to patients to visit.
-        round_block_started_at_tick: Tick when current plan was created.
-        
-        handover_block_idx: Index of the current handover block (-1 if not in one).
-        handover_initiated_this_block: Whether initiated contact in current block.
-    """
     def __init__(self, model: Model, unique_id: str):
         super().__init__(model, unique_id, "doctor")
-        self.panel_patients: list[str] = []  # List of patient IDs this doctor visits
-        
-        # State machine
+        self.panel_patients: list[str] = []
+
         self.current_state: str = "idle"
-        
-        # Block-level persistent visit plan (tick -> list of patients)
-        self.round_visits_per_tick: dict[int, list[str]] = {}  # Pre-assigned visits per tick
-        self.round_block_started_at_tick: int = -1  # When current plan was created
-        
-        # Handover state (track block to reset properly)
-        self.handover_block_idx: int = -1  # Current handover block index
+
+        self.round_visits_per_tick: dict[int, list[str]] = {}
+        self.round_block_started_at_tick: int = -1
+
+        self.handover_block_idx: int = -1
         self.handover_initiated_this_block: bool = False
-    
+
     def step(self):
-        """Execute one tick of doctor behavior based on current time and state."""
         time_min = self.model.get_current_time_min()
         tick = self.model.current_tick
-        
-        # Determine what state we should be in based on current time
+
         self.current_state = self._get_current_state(time_min)
-        
-        # Execute behavior appropriate to current state
+
         if self.current_state == "rounding":
             self._handle_rounding(tick, time_min)
         elif self.current_state == "handover":
             self._handle_handover(tick, time_min)
         elif self.current_state == "ad_hoc":
             self._handle_ad_hoc(tick, time_min)
-        # station and idle states don't generate proactive contacts
-    
+
     def _get_current_state(self, time_min: int) -> str:
-        """Determine the doctor's current state based on time of day.
-        
-        Priority order: rounding > handover > ad_hoc > station/idle
-        """
-        # Check doctor round blocks
         if in_any_block(time_min, DOCTOR_BLOCKS):
             return "rounding"
-        
-        # Check handover
         if in_any_block(time_min, HANDOVER_BLOCKS):
             return "handover"
-        
-        # Check ad hoc window
         if in_block(time_min, AD_HOC_BLOCK):
             return "ad_hoc"
-        
-        # Default to station/idle
         return "station"
-    
+
     def prepare_round_block(self, tick: int, time_min: int):
-        """Prepare the doctor's visit plan for entering a new doctor round block.
-        
-        Distributes all panel patients across ticks within the block with
-        proportional allocation and jitter to smooth the temporal distribution.
-        Ensures all patients are visited exactly once per block.
-        
-        Called once when entering a new DOCTOR_BLOCKS period.
-        """
         bidx = block_index(time_min, DOCTOR_BLOCKS)
         if bidx is None:
             return
-        
-        # Only prepare if not already prepared for this block
         if self.round_block_started_at_tick == tick:
             return
-        
-        # Copy and shuffle panel patients
-        panel_copy = list(self.panel_patients)
+
+        panel_copy = [pid for pid in self.panel_patients if self.model.is_patient_active(pid)]
         self.model.rng.shuffle(panel_copy)
-        
-        # Distribute patients across ticks with proportional + jitter allocation
+
         block_start_tick = DOCTOR_BLOCKS[bidx][0] // self.model.config.dt_min
         block_end_tick = DOCTOR_BLOCKS[bidx][1] // self.model.config.dt_min
-        
+
         self.round_visits_per_tick = {}
         remaining_patients = list(panel_copy)
-        
+
         for current_tick in range(block_start_tick, block_end_tick):
             ticks_left = block_end_tick - current_tick
             patients_left = len(remaining_patients)
-            
+
             if patients_left == 0:
                 break
-            
-            # Greedy allocation: ensure all visits complete by block end
+
             n_to_visit = max(1, math.ceil(patients_left / ticks_left))
-            # Add small jitter to reduce determinism
             jitter = self.model.rng.randint(-1, 2)
             n_to_visit = max(1, min(n_to_visit + jitter, patients_left))
-            
-            # Randomly select patients for this tick
+
             visits_this_tick = self.model.rng.sample(remaining_patients, k=n_to_visit)
             self.round_visits_per_tick[current_tick] = visits_this_tick
-            
-            # Remove assigned patients from remaining
+
             for pid in visits_this_tick:
                 remaining_patients.remove(pid)
-        
+
         self.round_block_started_at_tick = tick
-    
+
     def _handle_rounding(self, tick: int, time_min: int):
-        """Handle doctor round visits during scheduled blocks (7-8 AM, 3-4 PM).
-        
-        Executes visits pre-assigned to this tick from the block's visit plan.
-        Visits are pre-distributed across ticks with jitter to ensure smooth
-        temporal distribution and avoid quota-based spikiness.
-        
-        This approach ensures:
-        - All patients in panel are visited exactly once per block
-        - Smooth temporal distribution with randomized timing
-        - No artificial spikes from deterministic allocation
-        """
         bidx = block_index(time_min, DOCTOR_BLOCKS)
         if bidx is None:
             return
-        
+
         block_start_tick = DOCTOR_BLOCKS[bidx][0] // self.model.config.dt_min
-        
-        # Prepare visit plan on first tick of block
         if tick == block_start_tick:
             self.prepare_round_block(tick, time_min)
-        
-        # Execute visits scheduled for this tick (from pre-assigned plan)
+
         if tick in self.round_visits_per_tick:
             for pid in self.round_visits_per_tick[tick]:
-                self.model.record_contact(
-                    tick=tick,
-                    actor_id=self.unique_id,
-                    target_id=pid,
-                    event_type="doctor_round",
-                )
-    
+                if self.model.is_patient_active(pid):
+                    self.model.record_contact(
+                        tick=tick,
+                        actor_id=self.unique_id,
+                        target_id=pid,
+                        event_type="doctor_round",
+                    )
+
     def _handle_handover(self, tick: int, time_min: int):
-        """Handle shift handover interactions at nurse station.
-        
-        During handover periods, doctors may interact with nurses and other doctors.
-        
-        IMPROVED: Now agent-driven instead of purely model-managed.
-        Uses proper block_index() tracking to identify block transitions and reset
-        the initiated flag reliably for both morning and afternoon periods.
-        """
-        # Check if we're in a handover period using proper block indexing
         bidx = block_index(time_min, HANDOVER_BLOCKS)
         if bidx is None:
-            # Left a handover block; reset flag for next block
             if self.handover_block_idx != -1:
                 self.handover_block_idx = -1
                 self.handover_initiated_this_block = False
             return
-        
-        # Entering a new handover block; reset flag
+
         if bidx != self.handover_block_idx:
             self.handover_block_idx = bidx
             self.handover_initiated_this_block = False
-        
-        # Avoid excessive handover interactions per block (doctors are less vocal than nurses)
+
         if self.handover_initiated_this_block:
             return
-        
-        # Doctors have slightly lower initiation probability than nurses
         if self.model.rng.random() > 0.5:
             return
-        
-        # Doctor can interact with another doctor or a nurse
+
         interactant_option = self.model.rng.choice(["doctor", "nurse"])
-        
+
         if interactant_option == "doctor":
             other_doctors = [d for d in self.model.doctors if d.unique_id != self.unique_id]
             if other_doctors:
                 other = self.model.rng.choice(other_doctors)
-                # Check if we haven't recently contacted this doctor (undirected pair)
                 if not self.model.is_recent_contact(self.unique_id, other.unique_id, tick, window_ticks=5):
                     self.model.record_contact(
                         tick=tick,
@@ -758,10 +564,9 @@ class DoctorAgent(BaseHospitalAgent):
                         event_type="nurse_station",
                     )
                     self.handover_initiated_this_block = True
-        else:  # nurse
+        else:
             if self.model.nurses:
                 nurse = self.model.rng.choice(self.model.nurses)
-                # Check if we haven't recently contacted this nurse (undirected pair)
                 if not self.model.is_recent_contact(self.unique_id, nurse.unique_id, tick, window_ticks=5):
                     self.model.record_contact(
                         tick=tick,
@@ -770,25 +575,20 @@ class DoctorAgent(BaseHospitalAgent):
                         event_type="nurse_station",
                     )
                     self.handover_initiated_this_block = True
-    
+
     def _handle_ad_hoc(self, tick: int, time_min: int):
-        """Handle occasional unscheduled patient visits during daytime window (9 AM - 3 PM).
-        
-        With low probability, a doctor may initiate a spontaneous visit to a random patient
-        from their panel. Avoids excessive repeated contacts to the same patient.
-        """
         if not in_block(time_min, AD_HOC_BLOCK):
             return
-        
-        # Low probability of ad-hoc visit initiation (doctors initiate less than nurses)
         if self.model.rng.random() > (self.model.config.p_ad_hoc_tick * 0.15):
             return
-        
         if not self.panel_patients:
             return
-        
-        pid = self.model.rng.choice(self.panel_patients)
-        # Avoid excessive repeated ad-hoc contacts to same patient
+
+        active_panel = [pid for pid in self.panel_patients if self.model.is_patient_active(pid)]
+        if not active_panel:
+            return
+
+        pid = self.model.rng.choice(active_panel)
         if not self.model.is_recent_contact(self.unique_id, pid, tick, window_ticks=24):
             self.model.record_contact(
                 tick=tick,
@@ -799,73 +599,50 @@ class DoctorAgent(BaseHospitalAgent):
 
 
 # =========================================================
-# 5) MESA MODEL: HospitalContactModel - Core simulation engine
+# 5) MESA MODEL
 # =========================================================
 class HospitalContactModel(Model):
-    """
-    Mesa Model for hospital contact network simulation.
-    
-    Generates contact events between patients, nurses, and doctors during a single day,
-    based on scheduled activities (rounds, feeding, handovers) and random interactions.
-    No infection dynamics are simulated; this model only tracks who contacts whom.
-    
-    REFACTORED: This version is more agent-centric. Nurse and doctor agents
-    run their own step() methods and decide behavior based on state machines.
-    The model coordinates the environment, provides helper methods to agents,
-    manages agent scheduling, and handles remaining centralized events
-    (roommate interactions, nurse station general gathering).
-    """
     def __init__(self, config: SimConfig):
         super().__init__()
         self.config = config
         self.rng = random.Random(config.seed)
 
-        # Core maps for room management
         self.room_capacity_map: dict[str, int] = self._build_room_capacity_map()
         self.room_occupants: dict[str, list[str]] = {rid: [] for rid in self.room_capacity_map}
 
-        # Agent registries: maintain lists of each agent type for quick iteration
         self.patients: list[PatientAgent] = []
         self.nurses: list[NurseAgent] = []
         self.doctors: list[DoctorAgent] = []
-        self.agent_index: dict[str, BaseHospitalAgent] = {}  # Fast lookup by unique_id
+        self.agent_index: dict[str, BaseHospitalAgent] = {}
 
-        # Simulation logs
-        self.visit_events: list[dict] = []  # All recorded contact events
+        self.visit_events: list[dict] = []
 
-        # Daily bookkeeping
         self.current_tick = 0
         self.current_time_min = 0
 
-        # Track feeding assignments: feeding block index -> {nurse_id: [patient_ids]}
         self._feeding_block_assignments: dict[int, dict[str, list[str]]] = {}
-
-        # Track whether roommate event has occurred in a given room during a given hour
-        # Ensures at most one roommate event per room per hour
         self._room_hour_triggered: set[tuple[str, int]] = set()
-        
-        # Short-term contact tracking to avoid excessive repeated interactions.
-        # Key: (actor_id, target_id), Value: last_tick of contact
-        # Used to prevent duplicate ad-hoc or hand-over contacts within a time window.
         self._recent_contacts: dict[tuple[str, str], int] = {}
-
-        # Pre-sample random times during daytime when nurses gather at nurse station
         self._random_nurse_station_ticks = self._sample_random_nurse_station_ticks()
 
-        # Initialize all agents and establish assignments
-        self._init_agents()  # Create patient, nurse, and doctor instances
-        self._assign_patients_to_rooms_deterministic()  # Fill rooms by capacity
-        self._assign_nurse_room_caseloads()  # Each nurse gets adjacent rooms (round-robin)
-        self._assign_doctor_panels()  # Each doctor gets subset of patients (round-robin)
-        self._assign_daily_feeders()  # Randomly select 2 nurses as feeders for the day
+        # Multi-day tracking
+        self.total_admissions = 0
+        self.total_discharges = 0
+        self.daily_census_history: list[int] = []
+
+        self._init_agents()
+        self._assign_patients_to_rooms_deterministic()
+        self._assign_nurse_room_caseloads()
+        self._assign_doctor_panels()
+        self._assign_daily_feeders()
+
+        self.daily_census_history.append(self.get_current_patient_count())
 
     def _build_room_capacity_map(self) -> dict[str, int]:
-        """Create mapping of room IDs to bed capacities from config constants."""
         assert len(ROOM_CAPACITY_SPEC) == self.config.n_rooms
         return {f"room_{i}": cap for i, cap in enumerate(ROOM_CAPACITY_SPEC)}
 
     def _init_agents(self):
-        """Initialize all patient, nurse, and doctor agents and add to agent index."""
         for i in range(self.config.n_patients):
             pid = f"patient_{i}"
             p = PatientAgent(self, pid, room_id="")
@@ -885,42 +662,54 @@ class HospitalContactModel(Model):
             self.agent_index[did] = d
 
     def _assign_patients_to_rooms_deterministic(self):
-        """Assign patients to rooms according to room capacity in order (deterministic)."""
-        patient_iter = iter(self.patients)
+        initial_n = self.config.initial_patient_count
+        active_patients = self.patients[:initial_n]
+
+        for p in active_patients:
+            p.is_active = True
+            p.admission_day = 0
+            p.remaining_los_days = self.rng.randint(1, 8)
+
+        patient_iter = iter(active_patients)
         for room_id, capacity in self.room_capacity_map.items():
             for _ in range(capacity):
-                patient = next(patient_iter)
+                try:
+                    patient = next(patient_iter)
+                except StopIteration:
+                    return
                 patient.room_id = room_id
                 self.room_occupants[room_id].append(patient.unique_id)
 
-        total_capacity = sum(self.room_capacity_map.values())
-        assert total_capacity == self.config.n_patients, "Room capacity must exactly match patient count"
-
     def _assign_nurse_room_caseloads(self):
-        """Distribute rooms among nurses via round-robin assignment."""
+        for nurse in self.nurses:
+            nurse.caseload_rooms = []
+
         room_ids = sorted(self.room_capacity_map.keys(), key=lambda x: int(x.split("_")[1]))
-        for i, room_id in enumerate(room_ids):
+        occupied_rooms = [rid for rid in room_ids if len(self.room_occupants[rid]) > 0]
+
+        for i, room_id in enumerate(occupied_rooms):
             nurse = self.nurses[i % len(self.nurses)]
             nurse.caseload_rooms.append(room_id)
 
     def _assign_doctor_panels(self):
-        """Distribute patients among doctors via round-robin assignment."""
-        patient_ids = [p.unique_id for p in self.patients]
-        for i, pid in enumerate(patient_ids):
+        for doctor in self.doctors:
+            doctor.panel_patients = []
+
+        active_patient_ids = [p.unique_id for p in self.patients if p.is_active]
+        for i, pid in enumerate(active_patient_ids):
             doctor = self.doctors[i % len(self.doctors)]
             doctor.panel_patients.append(pid)
 
     def _assign_daily_feeders(self):
-        """Randomly select two nurses to serve as feeders for the day (without replacement)."""
-        feeder_indices = self.rng.sample(range(len(self.nurses)), k=2)
+        for nurse in self.nurses:
+            nurse.is_active_feeder = False
+
+        k = min(2, len(self.nurses))
+        feeder_indices = self.rng.sample(range(len(self.nurses)), k=k)
         for i, nurse in enumerate(self.nurses):
             nurse.is_active_feeder = i in feeder_indices
 
     def _sample_random_nurse_station_ticks(self) -> set[int]:
-        """Pre-sample random times during daytime when nurses gather at nurse station.
-        
-        Used in addition to scheduled handover periods for unscheduled nurse interactions.
-        """
         daytime_tick_start = AD_HOC_BLOCK[0] // self.config.dt_min
         daytime_tick_end = AD_HOC_BLOCK[1] // self.config.dt_min
         all_daytime_ticks = list(range(daytime_tick_start, daytime_tick_end))
@@ -929,45 +718,144 @@ class HospitalContactModel(Model):
         return set(self.rng.sample(all_daytime_ticks, k=k))
 
     # =========================================================
-    # Helper Methods for Agents to Call
+    # Helper methods
     # =========================================================
-    
     def get_current_time_min(self) -> int:
-        """Return current simulation time in minutes since start of day."""
         return self.current_time_min
-    
+
+    def get_current_day(self) -> int:
+        return self.current_tick // self.config.ticks_per_day
+
     def get_patients_in_room(self, room_id: str) -> list[str]:
-        """Return list of patient IDs currently in a given room."""
         return self.room_occupants.get(room_id, [])
-    
+
+    def get_current_patient_count(self) -> int:
+        return sum(1 for p in self.patients if p.is_active)
+
+    def is_patient_active(self, patient_id: str) -> bool:
+        p = self.agent_index.get(patient_id)
+        return isinstance(p, PatientAgent) and p.is_active
+
+    def _sample_poisson(self, lam: float) -> int:
+        L = math.exp(-lam)
+        k = 0
+        p = 1.0
+        while p > L:
+            k += 1
+            p *= self.rng.random()
+        return k - 1
+
+    def _find_first_available_bed(self) -> str | None:
+        for room_id, capacity in self.room_capacity_map.items():
+            if len(self.room_occupants[room_id]) < capacity:
+                return room_id
+        return None
+
+    def _get_inactive_patients_pool(self) -> list[PatientAgent]:
+        return [p for p in self.patients if not p.is_active]
+
+    def _discharge_patient(self, patient: PatientAgent):
+        if patient.room_id and patient.unique_id in self.room_occupants[patient.room_id]:
+            self.room_occupants[patient.room_id].remove(patient.unique_id)
+
+        patient.is_active = False
+        patient.room_id = ""
+        patient.admission_day = None
+        patient.remaining_los_days = None
+        self.total_discharges += 1
+
+    def _admit_patient(self, patient: PatientAgent, room_id: str):
+        patient.is_active = True
+        patient.room_id = room_id
+        patient.admission_day = self.get_current_day()
+        patient.remaining_los_days = 8
+        self.room_occupants[room_id].append(patient.unique_id)
+        self.total_admissions += 1
+
+    def _refresh_assignments_after_census_change(self):
+        for nurse in self.nurses:
+            nurse.caseload_rooms = []
+            nurse.round_visits_per_tick = {}
+            nurse.feeding_visits_per_tick = {}
+            nurse.round_block_started_at_tick = -1
+            nurse.feeding_block_started_at_tick = -1
+            nurse.is_active_feeder = False
+
+        for doctor in self.doctors:
+            doctor.panel_patients = []
+            doctor.round_visits_per_tick = {}
+            doctor.round_block_started_at_tick = -1
+
+        self._feeding_block_assignments = {}
+        self._assign_nurse_room_caseloads()
+        self._assign_doctor_panels()
+        self._assign_daily_feeders()
+
+    def _run_day_boundary_update(self):
+        active_patients = [p for p in self.patients if p.is_active]
+
+        for patient in active_patients:
+            if patient.remaining_los_days is not None:
+                patient.remaining_los_days -= 1
+
+        for patient in list(active_patients):
+            if patient.remaining_los_days is not None and patient.remaining_los_days <= 0:
+                self._discharge_patient(patient)
+
+        daily_admissions = self._sample_poisson(self.config.daily_admissions_mean)
+        inactive_pool = self._get_inactive_patients_pool()
+
+        for patient in inactive_pool:
+            if daily_admissions <= 0:
+                break
+            room_id = self._find_first_available_bed()
+            if room_id is None:
+                break
+            self._admit_patient(patient, room_id)
+            daily_admissions -= 1
+
+        self._refresh_assignments_after_census_change()
+        self.daily_census_history.append(self.get_current_patient_count())
+
+    def _sample_contact_duration(self, event_type: str, actor_type: str, target_type: str) -> int:
+        if actor_type == "nurse" and target_type == "patient":
+            mean = self.config.mean_nurse_patient_contact_duration_min
+        elif actor_type == "doctor" and target_type == "patient":
+            mean = self.config.mean_doctor_patient_contact_duration_min
+        else:
+            mean = DURATION_MIN_DEFAULT
+
+        if self.config.contact_duration_distribution == "exponential":
+            duration = max(1, int(round(self.rng.expovariate(1 / mean))))
+            return duration
+        return mean
+
     def record_contact(
         self,
         tick: int,
         actor_id: str,
         target_id: str,
         event_type: str,
-        duration_min: int = DURATION_MIN_DEFAULT,
+        duration_min: int | None = None,
     ):
-        """Record a single contact event initiated by an agent.
-        
-        Called from agent step() methods to log contacts they generate.
-        Automatically looks up room from target patient and determines actor/target types.
-        Also updates the short-term contact tracking dictionary using canonical
-        (undirected) pair keys to suppress repeated interactions between any pair.
-        """
         actor = self.agent_index[actor_id]
         target = self.agent_index[target_id]
         time_min = tick_to_time_min(tick, self.config.dt_min)
-        
-        # Get room: if target is patient, use their room; otherwise nurse_station
+
         if target.agent_type == "patient":
             room_id = target.room_id
+            if isinstance(target, PatientAgent) and not target.is_active:
+                return
         else:
             room_id = "nurse_station"
+
+        if duration_min is None:
+            duration_min = self._sample_contact_duration(event_type, actor.agent_type, target.agent_type)
 
         event = {
             "run_id": self.config.run_id,
             "tick": tick,
+            "day": self.get_current_day(),
             "time_min": time_min,
             "time_str": minutes_to_hhmm(time_min),
             "actor_id": actor_id,
@@ -979,64 +867,30 @@ class HospitalContactModel(Model):
             "duration_min": duration_min,
         }
         self.visit_events.append(event)
-        
-        # Update short-term contact tracking using canonical (sorted) pair key.
-        # This ensures (actor_id, target_id) and (target_id, actor_id) map to the same entry,
-        # treating the pair as undirected for suppression purposes.
+
         contact_pair = tuple(sorted([actor_id, target_id]))
         self._recent_contacts[contact_pair] = tick
-    
+
     def is_tick_in_block(self, tick: int, block: tuple[int, int]) -> bool:
-        """Check if a given tick falls within a time block [start, end)."""
         time_min = tick_to_time_min(tick, self.config.dt_min)
         return in_block(time_min, block)
-    
+
     def is_recent_contact(self, actor_id: str, target_id: str, current_tick: int, window_ticks: int = 12) -> bool:
-        """Check if two agents have had contact recently (within window_ticks).
-        
-        This prevents excessive repeated interactions between the same pair,
-        which would be unrealistic and create artificial star topologies.
-        Uses canonical (sorted) pair keys to treat interactions as undirected:
-        is_recent_contact(A, B) returns True iff (A, B) or (B, A) contacted recently.
-        
-        Args:
-            actor_id: First agent
-            target_id: Second agent
-            current_tick: Current simulation tick
-            window_ticks: Number of ticks to look back (default 12 = 1 hour)
-        
-        Returns:
-            True if the pair had contact within the window, False otherwise.
-        """
-        # Use canonical pair key (sorted) to treat pair as undirected
         contact_pair = tuple(sorted([actor_id, target_id]))
         if contact_pair not in self._recent_contacts:
             return False
-        
+
         last_contact_tick = self._recent_contacts[contact_pair]
         return (current_tick - last_contact_tick) < window_ticks
-    
+
     def get_feeding_assignment_for_nurse(self, nurse_id: str, bidx: int) -> list[str]:
-        """Get the list of patients assigned to a given nurse for a specific feeding block.
-        
-        Called by feeder nurses in their _handle_feeding() method.
-        Assignments are pre-generated on first call and cached.
-        
-        IMPROVEMENT: Now avoids making feeders unrealistically dominant.
-        Each feeder gets roughly 35-50% of patients (not 60-80% as before),
-        distributed among fewer total patients per block.
-        """
-        # If assignments for this block haven't been generated yet, create them
         if bidx not in self._feeding_block_assignments:
-            # Reduce feeding coverage to be more realistic and less nurse-centric
-            # instead of 60-80%, use smaller subset: 30-50% of patients
-            coverage = self.rng.uniform(0.30, 0.50)
-            n_target = max(1, int(round(self.config.n_patients * coverage)))
-            
-            patient_ids = [p.unique_id for p in self.patients]
-            selected = self.rng.sample(patient_ids, k=n_target)
-            
-            # Split between the two active feeders more evenly
+            coverage = self.rng.uniform(self.config.feeding_coverage_min, self.config.feeding_coverage_max)
+            active_patient_ids = [p.unique_id for p in self.patients if p.is_active]
+            n_target = max(1, int(round(len(active_patient_ids) * coverage))) if active_patient_ids else 0
+
+            selected = self.rng.sample(active_patient_ids, k=min(n_target, len(active_patient_ids))) if active_patient_ids else []
+
             active_feeders = [n for n in self.nurses if n.is_active_feeder]
             if len(active_feeders) == 2:
                 mid = len(selected) // 2
@@ -1046,29 +900,20 @@ class HospitalContactModel(Model):
                 }
             else:
                 self._feeding_block_assignments[bidx] = {nurse_id: selected}
-        
+
         return self._feeding_block_assignments[bidx].get(nurse_id, [])
 
     # =========================================================
-    # Model-Level Event Generation (not agent-driven)
+    # Model-level event generation
     # =========================================================
-    
     def _generate_roommate_events(self, tick: int, time_min: int):
-        """Generate interactions between roommates once per hour per room.
-        
-        Evaluates at the start of each hour (xx:00) for each room with 2+ patients.
-        At most one roommate event per room per hour.
-        
-        Kept at model level: Roommates interacting is not driven by individual agent
-        behavior; it's a passive background event that both agents experience similarly.
-        """
-        # Evaluate once per hour (every 12 ticks): at xx:00
         if time_min % 60 != 0:
             return
 
         hour_idx = time_min // 60
         for room_id, occupants in self.room_occupants.items():
-            if len(occupants) < 2:
+            active_occupants = [pid for pid in occupants if self.is_patient_active(pid)]
+            if len(active_occupants) < 2:
                 continue
 
             key = (room_id, hour_idx)
@@ -1076,14 +921,13 @@ class HospitalContactModel(Model):
                 continue
 
             if self.rng.random() < self.config.p_roommate_event_per_room_per_hour:
-                p1, p2 = self.rng.sample(occupants, k=2)
-                # Record as a model-initiated event
-                time_min_val = tick_to_time_min(tick, self.config.dt_min)
+                p1, p2 = self.rng.sample(active_occupants, k=2)
                 event = {
                     "run_id": self.config.run_id,
                     "tick": tick,
-                    "time_min": time_min_val,
-                    "time_str": minutes_to_hhmm(time_min_val),
+                    "day": self.get_current_day(),
+                    "time_min": tick_to_time_min(tick % self.config.ticks_per_day, self.config.dt_min),
+                    "time_str": minutes_to_hhmm(tick_to_time_min(tick % self.config.ticks_per_day, self.config.dt_min)),
                     "actor_id": p1,
                     "actor_type": "patient",
                     "target_id": p2,
@@ -1096,76 +940,40 @@ class HospitalContactModel(Model):
                 self._room_hour_triggered.add(key)
 
     def _generate_nurse_station_events(self, tick: int, time_min: int):
-        """Generate background staff interactions at the nurse station.
-        
-        Creates occasional random staff-to-staff contacts that happen at the nurse station.
-        This is a reduced, background-only version now that agents handle their own
-        handover and ad-hoc interactions.
-        
-        The model now generates only rare, unplanned encounters between staff members
-        who happen to pass through the nurse station, rather than scheduled gatherings.
-        Scheduled handover contacts are now agent-driven (see NurseAgent and DoctorAgent
-        _handle_handover() methods).
-        
-        Kept at model level: These are incidental, background interactions that don't
-        fit neatly into any individual agent's planned activities. They represent the
-        natural emergent effect of all staff moving through a shared space.
-        """
-        # Only generate background random nurse station events during daytime
-        # Don't replicate what agents are already doing during handover
-        is_random_daytime_tick = tick in self._random_nurse_station_ticks
-
+        is_random_daytime_tick = (tick % self.config.ticks_per_day) in self._random_nurse_station_ticks
         if not is_random_daytime_tick:
             return
-        
-        # Generate occasional nurse-nurse random encounters (very low rate)
+
         if self.rng.random() < 0.3 and len(self.nurses) >= 2:
             n1, n2 = self.rng.sample(self.nurses, k=2)
             if not self.is_recent_contact(n1.unique_id, n2.unique_id, tick, window_ticks=6):
-                time_min_val = tick_to_time_min(tick, self.config.dt_min)
-                event = {
-                    "run_id": self.config.run_id,
-                    "tick": tick,
-                    "time_min": time_min_val,
-                    "time_str": minutes_to_hhmm(time_min_val),
-                    "actor_id": n1.unique_id,
-                    "actor_type": "nurse",
-                    "target_id": n2.unique_id,
-                    "target_type": "nurse",
-                    "room_id": "nurse_station",
-                    "event_type": "nurse_station",
-                    "duration_min": DURATION_MIN_DEFAULT,
-                }
-                self.visit_events.append(event)
-                # Use canonical pair key for undirected tracking
-                contact_pair = tuple(sorted([n1.unique_id, n2.unique_id]))
-                self._recent_contacts[contact_pair] = tick
+                self.record_contact(
+                    tick=tick,
+                    actor_id=n1.unique_id,
+                    target_id=n2.unique_id,
+                    event_type="nurse_station",
+                    duration_min=DURATION_MIN_DEFAULT,
+                )
 
     def step(self):
-        """Execute one tick of the simulation.
-        
-        Now with a more agent-centric approach:
-        1. Update current time.
-        2. Step all agents (patients, nurses, doctors). Agents decide their behavior
-           and call model.record_contact() to log events.
-        3. Generate model-level events that aren't driven by individual agents
-           (roommate interactions, nurse station gatherings).
-        """
         tick = self.current_tick
-        time_min = tick_to_time_min(tick, self.config.dt_min)
+
+        if tick > 0 and tick % self.config.ticks_per_day == 0:
+            self._run_day_boundary_update()
+
+        time_min = tick_to_time_min(tick % self.config.ticks_per_day, self.config.dt_min)
         self.current_time_min = time_min
 
-        # Step all agents: they decide their behavior and generate contacts
         for patient in self.patients:
-            patient.step()
-        
+            if patient.is_active:
+                patient.step()
+
         for nurse in self.nurses:
             nurse.step()
-        
+
         for doctor in self.doctors:
             doctor.step()
-        
-        # Generate model-level events (not initiated by individual agents)
+
         self._generate_roommate_events(tick, time_min)
         self._generate_nurse_station_events(tick, time_min)
 
@@ -1173,21 +981,13 @@ class HospitalContactModel(Model):
 
 
 # =========================================================
-# 7) SIMULATION EXECUTION: Run one complete day
+# 6) SIMULATION EXECUTION
 # =========================================================
 def run_simulation(config: SimConfig) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-    """
-    Run one complete day of hospital contact simulation.
-    
-    Returns:
-        visit_df: Detailed log of all contact events
-        agg_df: Aggregated contact pairs with frequencies
-        summary_df: Summary statistics for the simulation run
-    """
     model = HospitalContactModel(config)
 
-    # Step through all ticks in a 24-hour day
-    for _ in range(config.ticks_per_day):
+    total_ticks = config.ticks_per_day * config.simulation_days
+    for _ in range(total_ticks):
         model.step()
 
     visit_df = pd.DataFrame(model.visit_events)
@@ -1208,25 +1008,19 @@ def run_simulation(config: SimConfig) -> tuple[pd.DataFrame, pd.DataFrame, pd.Da
     else:
         agg_df = build_aggregated_edges(visit_df)
 
-    summary_df = build_run_summary(config, visit_df, agg_df)
-
+    summary_df = build_run_summary(config, model, visit_df, agg_df)
     return visit_df, agg_df, summary_df
 
 
 # =========================================================
-# 8) DATA AGGREGATION & SUMMARY: Process simulation results
+# 7) DATA AGGREGATION & SUMMARY
 # =========================================================
 def build_aggregated_edges(visit_df: pd.DataFrame) -> pd.DataFrame:
-    """Aggregate contact events into unique undirected edges with frequency counts.
-    
-    Canonically orders each pair (alphabetically by ID) to merge bidirectional contacts.
-    """
     rows = []
     for _, r in visit_df.iterrows():
         a_id, a_type = r["actor_id"], r["actor_type"]
         b_id, b_type = r["target_id"], r["target_type"]
 
-        # undirected canonical ordering by id
         if a_id <= b_id:
             u_id, u_type, v_id, v_type = a_id, a_type, b_id, b_type
         else:
@@ -1258,17 +1052,16 @@ def build_aggregated_edges(visit_df: pd.DataFrame) -> pd.DataFrame:
 
 
 def edge_type(actor_type: str, target_type: str) -> str:
-    """Return the canonical 2-letter edge type code (e.g., 'NP', 'PP', 'DD')."""
     pair = sorted([actor_type[0].upper(), target_type[0].upper()])
-    return "".join(pair)  # e.g. ['N','P'] -> 'NP'
+    return "".join(pair)
 
 
-def build_run_summary(config: SimConfig, visit_df: pd.DataFrame, agg_df: pd.DataFrame) -> pd.DataFrame:
-    """Build a summary statistics table for the simulation run.
-    
-    Computes total events, edge type counts, network metrics (degree, weighted degree),
-    and identifies top nodes by centrality.
-    """
+def build_run_summary(
+    config: SimConfig,
+    model: HospitalContactModel,
+    visit_df: pd.DataFrame,
+    agg_df: pd.DataFrame,
+) -> pd.DataFrame:
     total_events = int(len(visit_df))
     unique_edges = int(len(agg_df))
 
@@ -1277,20 +1070,8 @@ def build_run_summary(config: SimConfig, visit_df: pd.DataFrame, agg_df: pd.Data
     if not visit_df.empty:
         for _, r in visit_df.iterrows():
             e = edge_type(r["actor_type"], r["target_type"])
-            if e == "NP":
-                type_counts["NP"] += 1
-            elif e == "DP":
-                type_counts["DP"] += 1
-            elif e == "PP":
-                type_counts["PP"] += 1
-            elif e == "NN":
-                type_counts["NN"] += 1
-            elif e == "DN":
-                type_counts["DN"] += 1
-            elif e == "DD":
-                type_counts["DD"] += 1
+            type_counts[e] += 1
 
-    # Degree / weighted degree from aggregated graph
     G = nx.Graph()
     if not agg_df.empty:
         for _, r in agg_df.iterrows():
@@ -1304,17 +1085,29 @@ def build_run_summary(config: SimConfig, visit_df: pd.DataFrame, agg_df: pd.Data
     top5_degree = sorted(degree.items(), key=lambda x: x[1], reverse=True)[:5]
     top5_wdegree = sorted(wdegree.items(), key=lambda x: x[1], reverse=True)[:5]
 
+    census_history = model.daily_census_history if model.daily_census_history else [model.get_current_patient_count()]
+    occupancy_history = [c / config.n_patients for c in census_history]
+
     summary = pd.DataFrame(
         [
             {
                 "run_id": config.run_id,
                 "seed": config.seed,
-                "N_patients": config.n_patients,
+                "N_patients_capacity": config.n_patients,
                 "N_nurses": config.n_nurses,
                 "N_doctors": config.n_doctors,
                 "N_rooms": config.n_rooms,
                 "dt_min": config.dt_min,
                 "ticks_per_day": config.ticks_per_day,
+                "simulation_days": config.simulation_days,
+                "initial_patient_count": config.initial_patient_count,
+                "total_admissions": model.total_admissions,
+                "total_discharges": model.total_discharges,
+                "final_patient_count": model.get_current_patient_count(),
+                "average_daily_census": float(sum(census_history) / len(census_history)),
+                "occupancy_mean_over_run": float(sum(occupancy_history) / len(occupancy_history)),
+                "occupancy_min_over_run": float(min(occupancy_history)),
+                "occupancy_max_over_run": float(max(occupancy_history)),
                 "total_events": total_events,
                 "unique_edges": unique_edges,
                 "total_PP_events": int(type_counts["PP"]),
@@ -1332,29 +1125,18 @@ def build_run_summary(config: SimConfig, visit_df: pd.DataFrame, agg_df: pd.Data
 
 
 # =========================================================
-# 10) CSV EXPORT: Save results to output files
+# 8) CSV EXPORT
 # =========================================================
-
-def export_csvs(config: SimConfig, visit_df: pd.DataFrame, agg_df: pd.DataFrame, summary_df: pd.DataFrame, run_output_dir: str | None = None):
-    """Export simulation results to CSV files in the run-specific output directory.
-    
-    Creates three CSV files in the run_output_dir: visit_log.csv, aggregated_edges.csv, 
-    and run_summary.csv. Each run gets its own folder, so previous results are never 
-    overwritten.
-    
-    Args:
-        config: Simulation configuration
-        visit_df: Detailed contact event log
-        agg_df: Aggregated contact pairs with frequencies
-        summary_df: Summary statistics for the run
-        run_output_dir: Run-specific output directory. If None, uses config.output_dir.
-    
-    Returns:
-        Tuple of (visit_path, agg_path, summary_path) for the exported CSV files.
-    """
+def export_csvs(
+    config: SimConfig,
+    visit_df: pd.DataFrame,
+    agg_df: pd.DataFrame,
+    summary_df: pd.DataFrame,
+    run_output_dir: str | None = None,
+):
     if run_output_dir is None:
         run_output_dir = config.output_dir
-    
+
     os.makedirs(run_output_dir, exist_ok=True)
 
     visit_path = os.path.join(run_output_dir, "visit_log.csv")
@@ -1369,14 +1151,9 @@ def export_csvs(config: SimConfig, visit_df: pd.DataFrame, agg_df: pd.DataFrame,
 
 
 # =========================================================
-# 9) VISUALIZATION: Network graphs and time series plots
+# 9) VISUALIZATION
 # =========================================================
 def plot_network(config: SimConfig, agg_df: pd.DataFrame, out_path: str):
-    """Create and save a network visualization using spring layout.
-    
-    Nodes are colored by role (patient=blue, nurse=orange, doctor=green).
-    Edge width represents contact frequency.
-    """
     G = nx.Graph()
     for _, r in agg_df.iterrows():
         G.add_node(r["u_id"], role=r["u_type"])
@@ -1392,7 +1169,6 @@ def plot_network(config: SimConfig, agg_df: pd.DataFrame, out_path: str):
         return
 
     pos = nx.spring_layout(G, seed=config.seed, k=0.45)
-
     role_to_color = {"patient": "#4C78A8", "nurse": "#F58518", "doctor": "#54A24B"}
     node_colors = [role_to_color.get(G.nodes[n].get("role", "patient"), "gray") for n in G.nodes()]
 
@@ -1402,7 +1178,6 @@ def plot_network(config: SimConfig, agg_df: pd.DataFrame, out_path: str):
     nx.draw_networkx_nodes(G, pos, node_size=220, node_color=node_colors, alpha=0.9)
     nx.draw_networkx_edges(G, pos, width=edge_widths, alpha=0.35)
 
-    # Reduce clutter by labeling only staff nodes
     staff_nodes = [n for n, d in G.nodes(data=True) if d.get("role") in {"nurse", "doctor"}]
     labels = {n: n for n in staff_nodes}
     nx.draw_networkx_labels(G, pos, labels=labels, font_size=7)
@@ -1415,32 +1190,30 @@ def plot_network(config: SimConfig, agg_df: pd.DataFrame, out_path: str):
 
 
 def plot_timeseries(config: SimConfig, visit_df: pd.DataFrame, out_path: str):
-    """Create and save a time series plot of contact events throughout the day.
-    
-    Shows total events per tick, and breakdown by Patient-Nurse and Patient-Doctor.
-    """
-    ticks = list(range(config.ticks_per_day))
-    total_counts = [0] * config.ticks_per_day
-    pn_counts = [0] * config.ticks_per_day
-    pd_counts = [0] * config.ticks_per_day
+    total_ticks = config.ticks_per_day * config.simulation_days
+    ticks = list(range(total_ticks))
+    total_counts = [0] * total_ticks
+    pn_counts = [0] * total_ticks
+    pd_counts = [0] * total_ticks
 
     if not visit_df.empty:
         for _, r in visit_df.iterrows():
             tick = int(r["tick"])
-            total_counts[tick] += 1
-            tpair = edge_type(r["actor_type"], r["target_type"])
-            if tpair == "NP":
-                pn_counts[tick] += 1
-            elif tpair == "DP":
-                pd_counts[tick] += 1
+            if 0 <= tick < total_ticks:
+                total_counts[tick] += 1
+                tpair = edge_type(r["actor_type"], r["target_type"])
+                if tpair == "NP":
+                    pn_counts[tick] += 1
+                elif tpair == "DP":
+                    pd_counts[tick] += 1
 
-    x_hours = [t * config.dt_min / 60.0 for t in ticks]
+    x_days = [t * config.dt_min / MINUTES_PER_DAY for t in ticks]
 
     plt.figure(figsize=(14, 5))
-    plt.plot(x_hours, total_counts, label="Total events", linewidth=1.8)
-    plt.plot(x_hours, pn_counts, label="PN events", linewidth=1.4)
-    plt.plot(x_hours, pd_counts, label="PD events", linewidth=1.4)
-    plt.xlabel("Hour of day")
+    plt.plot(x_days, total_counts, label="Total events", linewidth=1.2)
+    plt.plot(x_days, pn_counts, label="PN events", linewidth=1.0)
+    plt.plot(x_days, pd_counts, label="PD events", linewidth=1.0)
+    plt.xlabel("Simulation day")
     plt.ylabel("Events per 5-min tick")
     plt.title("Contact Events Time Series")
     plt.legend()
@@ -1451,11 +1224,6 @@ def plot_timeseries(config: SimConfig, visit_df: pd.DataFrame, out_path: str):
 
 
 def plot_degree_hist(config: SimConfig, agg_df: pd.DataFrame, out_path: str):
-    """Create and save degree distribution histograms.
-    
-    Shows both unweighted and weighted (by contact count) degree distributions,
-    separated by agent role.
-    """
     G = nx.Graph()
     for _, r in agg_df.iterrows():
         G.add_node(r["u_id"], role=r["u_type"])
@@ -1494,24 +1262,9 @@ def plot_degree_hist(config: SimConfig, agg_df: pd.DataFrame, out_path: str):
 
 
 def export_figures(config: SimConfig, visit_df: pd.DataFrame, agg_df: pd.DataFrame, run_output_dir: str | None = None):
-    """Generate and save all three visualization figures to the run-specific directory.
-    
-    Creates network graph, time series plot, and degree distribution histogram.
-    All figures are saved to run_output_dir/figures/ to keep each run's outputs
-    completely isolated from previous runs.
-    
-    Args:
-        config: Simulation configuration
-        visit_df: Detailed contact event log
-        agg_df: Aggregated contact pairs with frequencies
-        run_output_dir: Run-specific output directory. If None, uses config.output_dir.
-    
-    Returns:
-        Tuple of (network_path, timeseries_path, degree_hist_path) for the PNG files.
-    """
     if run_output_dir is None:
         run_output_dir = config.output_dir
-    
+
     fig_dir = os.path.join(run_output_dir, "figures")
     os.makedirs(fig_dir, exist_ok=True)
 
@@ -1527,10 +1280,9 @@ def export_figures(config: SimConfig, visit_df: pd.DataFrame, agg_df: pd.DataFra
 
 
 # =========================================================
-# 11) COMMAND-LINE INTERFACE & MAIN ENTRY POINT
+# 10) CLI & MAIN
 # =========================================================
 def parse_args() -> argparse.Namespace:
-    """Parse command-line arguments for run seed and run ID."""
     parser = argparse.ArgumentParser(description="Mesa hospital contact-network prototype (no infection)")
     parser.add_argument("--seed", type=int, default=DEFAULT_SEED, help="Random seed (default: 42)")
     parser.add_argument(
@@ -1543,14 +1295,11 @@ def parse_args() -> argparse.Namespace:
 
 
 def main():
-    """Main entry point: configure, run simulation, and export results to run-specific folder."""
     args = parse_args()
 
     run_id = args.run_id or str(int(datetime.utcnow().timestamp()))
     config = SimConfig(seed=args.seed, run_id=run_id)
-    
-    # Build a unique output directory for this run to avoid overwriting previous results.
-    # The directory name includes timestamp, seed, and run_id to uniquely identify the run.
+
     run_output_dir = build_run_output_dir(config.output_dir, config.run_id, config.seed)
 
     visit_df, agg_df, summary_df = run_simulation(config)
