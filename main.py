@@ -70,7 +70,6 @@ HANDOVER_BLOCKS = [(6 * 60 + 55, 7 * 60 + 5), (18 * 60 + 55, 19 * 60 + 5)]
 # 2) PARAMETERS & CONFIGURATION
 # =========================================================
 @dataclass
-@dataclass
 class SimConfig:
     seed: int = DEFAULT_SEED
     run_id: str = ""
@@ -621,13 +620,20 @@ class HospitalContactModel(Model):
         self.current_time_min = 0
 
         self._feeding_block_assignments: dict[int, dict[str, list[str]]] = {}
-        self._room_hour_triggered: set[tuple[str, int]] = set()
+
+        # FIX 1:
+        # A roommate trigger ne csak room_id + hour legyen, mert akkor
+        # az egész 30 napban egyszer aktiválódik ugyanarra az órára.
+        # A napi resetet is megtartjuk, de biztonságosan beletesszük a nap indexet is.
+        self._room_hour_triggered: set[tuple[str, int, int]] = set()
+
         self._recent_contacts: dict[tuple[str, str], int] = {}
         self._random_nurse_station_ticks = self._sample_random_nurse_station_ticks()
 
         # Multi-day tracking
         self.total_admissions = 0
         self.total_discharges = 0
+        self.daily_flow_log: list[dict] = []
         self.daily_census_history: list[int] = []
 
         self._init_agents()
@@ -661,6 +667,29 @@ class HospitalContactModel(Model):
             self.doctors.append(d)
             self.agent_index[did] = d
 
+    # FIX 2:
+    # Nem használt paraméterek rendbetétele és LOS konzisztencia.
+    # Bevezetünk központi LOS mintavételt, hogy:
+    # - az inicializált betegek
+    # - és az új felvételek
+    # ugyanabból a deklarált logikából kapjanak tartózkodási időt.
+    def _sample_los_days(self, distribution_name: str | None = None) -> int:
+        dist = distribution_name or self.config.los_distribution
+
+        if dist == "fixed":
+            return max(1, int(round(self.config.mean_los_days)))
+
+        if dist == "discrete_uniform_1_8":
+            return self.rng.randint(1, 8)
+
+        if dist == "exponential":
+            mean = max(1e-9, float(self.config.mean_los_days))
+            sampled = int(round(self.rng.expovariate(1.0 / mean)))
+            return max(1, sampled)
+
+        # fallback: konzervatív viselkedés
+        return max(1, int(round(self.config.mean_los_days)))
+
     def _assign_patients_to_rooms_deterministic(self):
         initial_n = self.config.initial_patient_count
         active_patients = self.patients[:initial_n]
@@ -668,7 +697,11 @@ class HospitalContactModel(Model):
         for p in active_patients:
             p.is_active = True
             p.admission_day = 0
-            p.remaining_los_days = self.rng.randint(1, 8)
+
+            # FIX 3:
+            # korábban hardcode randint(1, 8) volt.
+            # most a deklarált initial_remaining_los_distribution paramétert használjuk.
+            p.remaining_los_days = self._sample_los_days(self.config.initial_remaining_los_distribution)
 
         patient_iter = iter(active_patients)
         for room_id, capacity in self.room_capacity_map.items():
@@ -768,7 +801,11 @@ class HospitalContactModel(Model):
         patient.is_active = True
         patient.room_id = room_id
         patient.admission_day = self.get_current_day()
-        patient.remaining_los_days = 8
+
+        # FIX 4:
+        # korábban fix 8 nap volt, most a deklarált LOS logikát használjuk.
+        patient.remaining_los_days = self._sample_los_days(self.config.los_distribution)
+
         self.room_occupants[room_id].append(patient.unique_id)
         self.total_admissions += 1
 
@@ -792,6 +829,10 @@ class HospitalContactModel(Model):
         self._assign_daily_feeders()
 
     def _run_day_boundary_update(self):
+        day_idx = self.get_current_day()
+        admissions_today = 0
+        discharges_today = 0
+
         active_patients = [p for p in self.patients if p.is_active]
 
         for patient in active_patients:
@@ -801,8 +842,21 @@ class HospitalContactModel(Model):
         for patient in list(active_patients):
             if patient.remaining_los_days is not None and patient.remaining_los_days <= 0:
                 self._discharge_patient(patient)
+                discharges_today += 1        
+        
 
-        daily_admissions = self._sample_poisson(self.config.daily_admissions_mean)
+         # FIX 5:
+        # Stochastic admission szabály a target occupancy körüli visszatöltéshez.
+        current_census = self.get_current_patient_count()
+
+        target_gap = (self.config.target_bed_occupancy * self.config.ward_capacity) - current_census
+        expected_admissions = max(0.0, target_gap)
+
+        daily_admissions = self._sample_poisson(expected_admissions)
+
+        available_beds = self.config.ward_capacity - current_census
+        daily_admissions = min(daily_admissions, available_beds)
+
         inactive_pool = self._get_inactive_patients_pool()
 
         for patient in inactive_pool:
@@ -812,11 +866,29 @@ class HospitalContactModel(Model):
             if room_id is None:
                 break
             self._admit_patient(patient, room_id)
+            admissions_today += 1
             daily_admissions -= 1
+                
+
+        # FIX 6:
+        # napi reset a roommate triggerhez
+        self._room_hour_triggered.clear()
 
         self._refresh_assignments_after_census_change()
-        self.daily_census_history.append(self.get_current_patient_count())
 
+        census_end_of_day = self.get_current_patient_count()
+        self.daily_census_history.append(census_end_of_day)
+
+        self.daily_flow_log.append(
+            {
+                "day": int(day_idx),
+                "admissions": int(admissions_today),
+                "discharges": int(discharges_today),
+                "census_end_of_day": int(census_end_of_day),
+                "occupancy_end_of_day": float(census_end_of_day / self.config.ward_capacity),
+            }
+        )        
+        
     def _sample_contact_duration(self, event_type: str, actor_type: str, target_type: str) -> int:
         if actor_type == "nurse" and target_type == "patient":
             mean = self.config.mean_nurse_patient_contact_duration_min
@@ -840,6 +912,9 @@ class HospitalContactModel(Model):
     ):
         actor = self.agent_index[actor_id]
         target = self.agent_index[target_id]
+
+        # FIX 7:
+        # egységes abszolút időkezelés
         time_min = tick_to_time_min(tick, self.config.dt_min)
 
         if target.agent_type == "patient":
@@ -911,23 +986,32 @@ class HospitalContactModel(Model):
             return
 
         hour_idx = time_min // 60
+        day_idx = self.get_current_day()
+
         for room_id, occupants in self.room_occupants.items():
             active_occupants = [pid for pid in occupants if self.is_patient_active(pid)]
             if len(active_occupants) < 2:
                 continue
 
-            key = (room_id, hour_idx)
+            # FIX 8:
+            # day-aware kulcs
+            key = (room_id, day_idx, hour_idx)
             if key in self._room_hour_triggered:
                 continue
 
             if self.rng.random() < self.config.p_roommate_event_per_room_per_hour:
                 p1, p2 = self.rng.sample(active_occupants, k=2)
+
+                # FIX 9:
+                # roommate eseményeknél is abszolút időt használunk
+                abs_time_min = tick_to_time_min(tick, self.config.dt_min)
+
                 event = {
                     "run_id": self.config.run_id,
                     "tick": tick,
-                    "day": self.get_current_day(),
-                    "time_min": tick_to_time_min(tick % self.config.ticks_per_day, self.config.dt_min),
-                    "time_str": minutes_to_hhmm(tick_to_time_min(tick % self.config.ticks_per_day, self.config.dt_min)),
+                    "day": day_idx,
+                    "time_min": abs_time_min,
+                    "time_str": minutes_to_hhmm(abs_time_min),
                     "actor_id": p1,
                     "actor_type": "patient",
                     "target_id": p2,
@@ -983,7 +1067,8 @@ class HospitalContactModel(Model):
 # =========================================================
 # 6) SIMULATION EXECUTION
 # =========================================================
-def run_simulation(config: SimConfig) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+
+def run_simulation(config: SimConfig) -> tuple[HospitalContactModel, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     model = HospitalContactModel(config)
 
     total_ticks = config.ticks_per_day * config.simulation_days
@@ -1009,7 +1094,7 @@ def run_simulation(config: SimConfig) -> tuple[pd.DataFrame, pd.DataFrame, pd.Da
         agg_df = build_aggregated_edges(visit_df)
 
     summary_df = build_run_summary(config, model, visit_df, agg_df)
-    return visit_df, agg_df, summary_df
+    return model, visit_df, agg_df, summary_df
 
 
 # =========================================================
@@ -1278,6 +1363,438 @@ def export_figures(config: SimConfig, visit_df: pd.DataFrame, agg_df: pd.DataFra
 
     return network_path, timeseries_path, degree_hist_path
 
+# =========================================================
+# 9/B) OUTPUT ANALYSIS
+# =========================================================
+def _normalize_role_pair(actor_type: str, target_type: str) -> str:
+    pair = tuple(sorted([actor_type, target_type]))
+    mapping = {
+        ("patient", "patient"): "PP",
+        ("nurse", "patient"): "NP",
+        ("doctor", "patient"): "DP",
+        ("nurse", "nurse"): "NN",
+        ("doctor", "nurse"): "DN",
+        ("doctor", "doctor"): "DD",
+    }
+    return mapping[pair]
+
+
+def build_daily_timeseries_dataset(config: SimConfig, visit_df: pd.DataFrame) -> pd.DataFrame:
+    if visit_df.empty:
+        return pd.DataFrame(
+            columns=[
+                "day",
+                "total_events",
+                "PP",
+                "NP",
+                "DP",
+                "NN",
+                "DN",
+                "DD",
+                "unique_patients",
+                "unique_staff",
+                "unique_all_agents",
+            ]
+        )
+
+    df = visit_df.copy()
+
+    if "day" not in df.columns:
+        df["day"] = (df["tick"] // config.ticks_per_day).astype(int)
+
+    df["role_pair"] = df.apply(
+        lambda r: _normalize_role_pair(r["actor_type"], r["target_type"]),
+        axis=1,
+    )
+
+    daily_total = df.groupby("day").size().rename("total_events")
+
+    daily_pairs = (
+        df.groupby(["day", "role_pair"])
+        .size()
+        .unstack(fill_value=0)
+        .reindex(columns=["PP", "NP", "DP", "NN", "DN", "DD"], fill_value=0)
+    )
+
+    patient_actor = df.loc[df["actor_type"] == "patient", ["day", "actor_id"]].rename(
+        columns={"actor_id": "agent_id"}
+    )
+    patient_target = df.loc[df["target_type"] == "patient", ["day", "target_id"]].rename(
+        columns={"target_id": "agent_id"}
+    )
+    daily_unique_patients = (
+        pd.concat([patient_actor, patient_target], ignore_index=True)
+        .drop_duplicates()
+        .groupby("day")["agent_id"]
+        .nunique()
+        .rename("unique_patients")
+    )
+
+    staff_actor = df.loc[df["actor_type"].isin(["nurse", "doctor"]), ["day", "actor_id"]].rename(
+        columns={"actor_id": "agent_id"}
+    )
+    staff_target = df.loc[df["target_type"].isin(["nurse", "doctor"]), ["day", "target_id"]].rename(
+        columns={"target_id": "agent_id"}
+    )
+    daily_unique_staff = (
+        pd.concat([staff_actor, staff_target], ignore_index=True)
+        .drop_duplicates()
+        .groupby("day")["agent_id"]
+        .nunique()
+        .rename("unique_staff")
+    )
+
+    all_actor = df[["day", "actor_id"]].rename(columns={"actor_id": "agent_id"})
+    all_target = df[["day", "target_id"]].rename(columns={"target_id": "agent_id"})
+    daily_unique_all = (
+        pd.concat([all_actor, all_target], ignore_index=True)
+        .drop_duplicates()
+        .groupby("day")["agent_id"]
+        .nunique()
+        .rename("unique_all_agents")
+    )
+
+    ts_df = pd.concat(
+        [
+            daily_total,
+            daily_pairs,
+            daily_unique_patients,
+            daily_unique_staff,
+            daily_unique_all,
+        ],
+        axis=1,
+    ).fillna(0).reset_index()
+
+    int_cols = [
+        "day",
+        "total_events",
+        "PP",
+        "NP",
+        "DP",
+        "NN",
+        "DN",
+        "DD",
+        "unique_patients",
+        "unique_staff",
+        "unique_all_agents",
+    ]
+    for c in int_cols:
+        if c in ts_df.columns:
+            ts_df[c] = ts_df[c].astype(int)
+
+    return ts_df
+
+
+def build_role_pair_tables(visit_df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    if visit_df.empty:
+        summary = pd.DataFrame(columns=["role_pair", "count", "ratio"])
+        matrix_counts = pd.DataFrame(
+            0,
+            index=["patient", "nurse", "doctor"],
+            columns=["patient", "nurse", "doctor"],
+        )
+        matrix_ratios = matrix_counts.astype(float)
+        return summary, matrix_counts, matrix_ratios
+
+    df = visit_df.copy()
+    df["role_pair"] = df.apply(
+        lambda r: _normalize_role_pair(r["actor_type"], r["target_type"]),
+        axis=1,
+    )
+
+    pair_counts = (
+        df["role_pair"]
+        .value_counts()
+        .reindex(["PP", "NP", "DP", "NN", "DN", "DD"], fill_value=0)
+    )
+
+    summary = pair_counts.rename_axis("role_pair").reset_index(name="count")
+    total = summary["count"].sum()
+    summary["ratio"] = summary["count"] / total if total > 0 else 0.0
+
+    matrix_counts = pd.DataFrame(
+        0,
+        index=["patient", "nurse", "doctor"],
+        columns=["patient", "nurse", "doctor"],
+    )
+
+    mapping = {
+        "PP": ("patient", "patient"),
+        "NP": ("patient", "nurse"),
+        "DP": ("patient", "doctor"),
+        "NN": ("nurse", "nurse"),
+        "DN": ("nurse", "doctor"),
+        "DD": ("doctor", "doctor"),
+    }
+
+    for _, row in summary.iterrows():
+        rp = row["role_pair"]
+        count = int(row["count"])
+        a, b = mapping[rp]
+        matrix_counts.loc[a, b] = count
+        matrix_counts.loc[b, a] = count
+
+    matrix_ratios = matrix_counts / total if total > 0 else matrix_counts.astype(float)
+
+    return summary, matrix_counts, matrix_ratios
+
+
+def build_degree_tables(agg_df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
+    if agg_df.empty:
+        node_df = pd.DataFrame(columns=["node_id", "role", "degree", "weighted_degree"])
+        role_df = pd.DataFrame(
+            columns=["role", "n_nodes", "mean_degree", "median_degree", "std_degree", "min_degree", "max_degree",
+                     "mean_weighted_degree", "median_weighted_degree", "std_weighted_degree",
+                     "min_weighted_degree", "max_weighted_degree"]
+        )
+        return node_df, role_df
+
+    left = agg_df[["u_id", "u_type", "total_contact_count"]].rename(
+        columns={"u_id": "node_id", "u_type": "role"}
+    )
+    right = agg_df[["v_id", "v_type", "total_contact_count"]].rename(
+        columns={"v_id": "node_id", "v_type": "role"}
+    )
+
+    long_df = pd.concat([left, right], ignore_index=True)
+
+    node_df = (
+        long_df.groupby(["node_id", "role"], as_index=False)
+        .agg(
+            degree=("total_contact_count", "size"),
+            weighted_degree=("total_contact_count", "sum"),
+        )
+        .sort_values(["role", "weighted_degree", "degree"], ascending=[True, False, False])
+        .reset_index(drop=True)
+    )
+
+    role_df = (
+        node_df.groupby("role", as_index=False)
+        .agg(
+            n_nodes=("node_id", "count"),
+            mean_degree=("degree", "mean"),
+            median_degree=("degree", "median"),
+            std_degree=("degree", "std"),
+            min_degree=("degree", "min"),
+            max_degree=("degree", "max"),
+            mean_weighted_degree=("weighted_degree", "mean"),
+            median_weighted_degree=("weighted_degree", "median"),
+            std_weighted_degree=("weighted_degree", "std"),
+            min_weighted_degree=("weighted_degree", "min"),
+            max_weighted_degree=("weighted_degree", "max"),
+        )
+    )
+
+    role_df = role_df.fillna(0)
+
+    return node_df, role_df
+
+def build_daily_flow_dataframe(model: HospitalContactModel) -> pd.DataFrame:
+    if not model.daily_flow_log:
+        return pd.DataFrame(
+            columns=[
+                "day",
+                "admissions",
+                "discharges",
+                "census_end_of_day",
+                "occupancy_end_of_day",
+            ]
+        )
+
+    df = pd.DataFrame(model.daily_flow_log).sort_values("day").reset_index(drop=True)
+    return df
+
+def plot_daily_events_analysis(ts_df: pd.DataFrame, out_path: str):
+    plt.figure(figsize=(14, 6))
+
+    if ts_df.empty:
+        plt.title("Daily events (empty)")
+        plt.xlabel("Day")
+        plt.ylabel("Events")
+        plt.tight_layout()
+        plt.savefig(out_path, dpi=160)
+        plt.close()
+        return
+
+    plt.plot(ts_df["day"], ts_df["total_events"], label="Total", linewidth=1.8)
+    plt.plot(ts_df["day"], ts_df["PP"], label="PP", linewidth=1.0)
+    plt.plot(ts_df["day"], ts_df["NP"], label="NP", linewidth=1.0)
+    plt.plot(ts_df["day"], ts_df["DP"], label="DP", linewidth=1.0)
+
+    plt.xlabel("Day")
+    plt.ylabel("Events")
+    plt.title("Daily contact events")
+    plt.legend()
+    plt.grid(alpha=0.25)
+    plt.tight_layout()
+    plt.savefig(out_path, dpi=160)
+    plt.close()
+
+
+def plot_daily_unique_patients(ts_df: pd.DataFrame, out_path: str):
+    plt.figure(figsize=(14, 5))
+
+    if ts_df.empty:
+        plt.title("Daily unique patients (empty)")
+        plt.xlabel("Day")
+        plt.ylabel("Unique patients")
+        plt.tight_layout()
+        plt.savefig(out_path, dpi=160)
+        plt.close()
+        return
+
+    plt.plot(ts_df["day"], ts_df["unique_patients"], linewidth=1.5)
+    plt.xlabel("Day")
+    plt.ylabel("Unique patients with any contact")
+    plt.title("Daily unique patients")
+    plt.grid(alpha=0.25)
+    plt.tight_layout()
+    plt.savefig(out_path, dpi=160)
+    plt.close()
+
+
+def plot_role_pair_bar(role_pair_summary_df: pd.DataFrame, out_path: str):
+    plt.figure(figsize=(10, 5))
+
+    if role_pair_summary_df.empty:
+        plt.title("Role-pair counts (empty)")
+        plt.xlabel("Role pair")
+        plt.ylabel("Count")
+        plt.tight_layout()
+        plt.savefig(out_path, dpi=160)
+        plt.close()
+        return
+
+    plt.bar(role_pair_summary_df["role_pair"], role_pair_summary_df["count"])
+    plt.xlabel("Role pair")
+    plt.ylabel("Count")
+    plt.title("Role-pair contact counts")
+    plt.grid(axis="y", alpha=0.25)
+    plt.tight_layout()
+    plt.savefig(out_path, dpi=160)
+    plt.close()
+
+
+def plot_edge_weight_histogram(agg_df: pd.DataFrame, out_path: str):
+    plt.figure(figsize=(10, 5))
+
+    if agg_df.empty:
+        plt.title("Edge weight distribution (empty)")
+        plt.xlabel("Total contact count")
+        plt.ylabel("Frequency")
+        plt.tight_layout()
+        plt.savefig(out_path, dpi=160)
+        plt.close()
+        return
+
+    plt.hist(agg_df["total_contact_count"], bins=20, alpha=0.8)
+    plt.xlabel("Edge weight (total contact count)")
+    plt.ylabel("Frequency")
+    plt.title("Edge weight distribution")
+    plt.grid(axis="y", alpha=0.25)
+    plt.tight_layout()
+    plt.savefig(out_path, dpi=160)
+    plt.close()
+
+def plot_daily_flow(daily_flow_df: pd.DataFrame, out_path: str):
+    plt.figure(figsize=(14, 6))
+
+    if daily_flow_df.empty:
+        plt.title("Daily admissions, discharges, and census (empty)")
+        plt.xlabel("Day")
+        plt.ylabel("Count")
+        plt.tight_layout()
+        plt.savefig(out_path, dpi=160)
+        plt.close()
+        return
+
+    plt.plot(
+        daily_flow_df["day"],
+        daily_flow_df["census_end_of_day"],
+        label="Census end of day",
+        linewidth=1.8,
+    )
+    plt.plot(
+        daily_flow_df["day"],
+        daily_flow_df["admissions"],
+        label="Admissions",
+        linewidth=1.2,
+    )
+    plt.plot(
+        daily_flow_df["day"],
+        daily_flow_df["discharges"],
+        label="Discharges",
+        linewidth=1.2,
+    )
+
+    plt.xlabel("Day")
+    plt.ylabel("Count")
+    plt.title("Daily admissions, discharges, and census")
+    plt.legend()
+    plt.grid(alpha=0.25)
+    plt.tight_layout()
+    plt.savefig(out_path, dpi=160)
+    plt.close()
+
+def export_analysis_outputs(
+    config: SimConfig,
+    model: HospitalContactModel,
+    visit_df: pd.DataFrame,
+    agg_df: pd.DataFrame,
+    summary_df: pd.DataFrame,
+    run_output_dir: str,
+):
+    analysis_dir = os.path.join(run_output_dir, "analysis")
+    os.makedirs(analysis_dir, exist_ok=True)
+
+    ts_df = build_daily_timeseries_dataset(config, visit_df)
+    role_pair_summary_df, role_pair_matrix_counts_df, role_pair_matrix_ratios_df = build_role_pair_tables(visit_df)
+    degree_node_df, degree_role_df = build_degree_tables(agg_df)
+    daily_flow_df = build_daily_flow_dataframe(model)    
+    
+    ts_path = os.path.join(analysis_dir, "timeseries_daily.csv")
+    role_pair_summary_path = os.path.join(analysis_dir, "role_pair_summary.csv")
+    role_pair_counts_path = os.path.join(analysis_dir, "role_pair_matrix_counts.csv")
+    role_pair_ratios_path = os.path.join(analysis_dir, "role_pair_matrix_ratios.csv")
+    degree_node_path = os.path.join(analysis_dir, "degree_summary_by_node.csv")
+    degree_role_path = os.path.join(analysis_dir, "degree_summary_by_role.csv")
+    daily_flow_path = os.path.join(analysis_dir, "daily_flow.csv")
+
+    ts_df.to_csv(ts_path, index=False)
+    role_pair_summary_df.to_csv(role_pair_summary_path, index=False)
+    role_pair_matrix_counts_df.to_csv(role_pair_counts_path, index=True)
+    role_pair_matrix_ratios_df.to_csv(role_pair_ratios_path, index=True)
+    degree_node_df.to_csv(degree_node_path, index=False)
+    degree_role_df.to_csv(degree_role_path, index=False)
+    daily_flow_df.to_csv(daily_flow_path, index=False)
+
+    daily_events_fig_path = os.path.join(analysis_dir, "daily_events.png")
+    daily_unique_patients_fig_path = os.path.join(analysis_dir, "daily_unique_patients.png")
+    role_pair_bar_fig_path = os.path.join(analysis_dir, "role_pair_bar.png")
+    edge_weight_hist_fig_path = os.path.join(analysis_dir, "edge_weight_hist.png")
+    daily_flow_fig_path = os.path.join(analysis_dir, "daily_flow.png")
+
+    plot_daily_events_analysis(ts_df, daily_events_fig_path)
+    plot_daily_unique_patients(ts_df, daily_unique_patients_fig_path)
+    plot_role_pair_bar(role_pair_summary_df, role_pair_bar_fig_path)
+    plot_edge_weight_histogram(agg_df, edge_weight_hist_fig_path)
+    plot_daily_flow(daily_flow_df, daily_flow_fig_path)
+
+    return {
+        "analysis_dir": analysis_dir,
+        "timeseries_daily_csv": ts_path,
+        "role_pair_summary_csv": role_pair_summary_path,
+        "role_pair_matrix_counts_csv": role_pair_counts_path,
+        "role_pair_matrix_ratios_csv": role_pair_ratios_path,
+        "degree_summary_by_node_csv": degree_node_path,
+        "degree_summary_by_role_csv": degree_role_path,
+        "daily_flow_csv": daily_flow_path,
+        "daily_events_png": daily_events_fig_path,
+        "daily_unique_patients_png": daily_unique_patients_fig_path,
+        "role_pair_bar_png": role_pair_bar_fig_path,
+        "edge_weight_hist_png": edge_weight_hist_fig_path,
+        "daily_flow_png": daily_flow_fig_path,
+    }
 
 # =========================================================
 # 10) CLI & MAIN
@@ -1302,13 +1819,22 @@ def main():
 
     run_output_dir = build_run_output_dir(config.output_dir, config.run_id, config.seed)
 
-    visit_df, agg_df, summary_df = run_simulation(config)
+    model, visit_df, agg_df, summary_df = run_simulation(config)
     visit_path, agg_path, summary_path = export_csvs(config, visit_df, agg_df, summary_df, run_output_dir)
     net_path, ts_path, deg_path = export_figures(config, visit_df, agg_df, run_output_dir)
 
+    analysis_paths = export_analysis_outputs(
+        config=config,
+        model=model,
+        visit_df=visit_df,
+        agg_df=agg_df,
+        summary_df=summary_df,
+        run_output_dir=run_output_dir,
+    )
+
     total_events = int(summary_df.loc[0, "total_events"])
     unique_edges = int(summary_df.loc[0, "unique_edges"])
-
+    
     print("\n=== Simulation finished ===")
     print(f"run_id={config.run_id} | seed={config.seed}")
     print(f"total_events={total_events}, unique_edges={unique_edges}")
@@ -1320,7 +1846,19 @@ def main():
     print(f"- {net_path}")
     print(f"- {ts_path}")
     print(f"- {deg_path}")
-
+    print("\nAnalysis files:")
+    print(f"- {analysis_paths['timeseries_daily_csv']}")
+    print(f"- {analysis_paths['role_pair_summary_csv']}")
+    print(f"- {analysis_paths['role_pair_matrix_counts_csv']}")
+    print(f"- {analysis_paths['role_pair_matrix_ratios_csv']}")
+    print(f"- {analysis_paths['degree_summary_by_node_csv']}")
+    print(f"- {analysis_paths['degree_summary_by_role_csv']}")
+    print(f"- {analysis_paths['daily_flow_csv']}")
+    print(f"- {analysis_paths['daily_events_png']}")
+    print(f"- {analysis_paths['daily_unique_patients_png']}")
+    print(f"- {analysis_paths['role_pair_bar_png']}")
+    print(f"- {analysis_paths['edge_weight_hist_png']}")
+    print(f"- {analysis_paths['daily_flow_png']}")
 
 if __name__ == "__main__":
     main()
