@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Single-file Mesa prototype: 1 ward hospital contact network generation (NO infection dynamics).
+Single-file Mesa prototype: 1 ward hospital contact network generation WITH infection dynamics.
 
 REFACTORED VERSION: More agent-centric behavior with explicit agent-level state machines.
 Nurses and doctors now have their own step() methods and decide their behavior based on
@@ -11,7 +11,7 @@ MULTI-DAY EXTENSION:
 - 30-day simulation
 - dynamic admissions/discharges
 - fixed baseline staffing
-- no infection dynamics yet
+- infection dynamics included
 
 Outputs:
 - outputs/visit_log.csv
@@ -117,10 +117,55 @@ class SimConfig:
     feeding_coverage_max: float = 0.50
     p_ad_hoc_tick: float = 0.20
     ad_hoc_max_events_per_tick: int = 2
-    p_roommate_event_per_room_per_hour: float = 0.10
+    p_roommate_event_per_room_per_hour: float = 0.50
     nurse_station_random_ticks_per_day: int = 10
 
     output_dir: str = "outputs"
+
+    # =========================================================
+    # Infection dynamics configuration
+    # =========================================================
+    initial_seed_infections: int = 1
+    seed_in_first_days: int = 2
+
+    p_symptomatic: float = 0.60
+    infection_fatality_ratio: float = 0.0104
+
+    # E_lat duration
+    latent_shape: float = 1.3521
+    latent_scale_days: float = 2.0
+
+    # E_inf duration (presymptomatic infectious period)
+    presymptomatic_shape: float = 2.0
+    presymptomatic_scale_days: float = 1.5
+
+    # I_asym recovery
+    recovery_asym_shape: float = 2.0
+    recovery_asym_scale_days: float = 2.5
+
+    # I_sym recovery
+    recovery_sym_shape: float = 4.0
+    recovery_sym_scale_days: float = 1.75
+
+    # death after symptomatic onset
+    death_shape: float = 4.9383
+    death_scale_days: float = 3.6045
+
+    # transmission placeholders, later to calibrate
+    beta_patient_patient_per_5min: float = 0.01
+    beta_hcw_to_patient_per_5min: float = 0.02
+    beta_patient_to_hcw_per_5min: float = 0.02
+
+    # relative infectiousness by stage
+    e_inf_relative_infectiousness: float = 0.80
+    i_asym_relative_infectiousness: float = 0.60
+    i_sym_relative_infectiousness: float = 1.00
+
+    isolation_transmission_multiplier: float = 0.30
+
+    # transient HCW contamination
+    hcw_contamination_duration_days: float = 0.5
+    hand_hygiene_clearance_prob_after_patient_contact: float = 0.20
 
 
 # =========================================================
@@ -141,6 +186,14 @@ def minutes_to_hhmm(total_minutes: int) -> str:
     hh = (total_minutes // 60) % 24
     mm = total_minutes % 60
     return f"{hh:02d}:{mm:02d}"
+
+
+def days_to_ticks(days: float, dt_min: int) -> int:
+    return max(1, int(round((days * 24 * 60) / dt_min)))
+
+
+def sample_gamma_days(rng: random.Random, shape: float, scale_days: float) -> float:
+    return max(1e-9, rng.gammavariate(shape, scale_days))
 
 
 def in_any_block(time_min: int, blocks: list[tuple[int, int]]) -> bool:
@@ -171,7 +224,7 @@ class BaseHospitalAgent(Agent):
 
 class PatientAgent(BaseHospitalAgent):
     """
-    Passive patient agent with multi-day stay attributes.
+    Passive patient agent with multi-day stay attributes and epidemiological state.
     """
     def __init__(
         self,
@@ -188,10 +241,26 @@ class PatientAgent(BaseHospitalAgent):
         self.remaining_los_days = remaining_los_days
         self.is_active = is_active
 
+        # Epidemiological state:
+        # S, E_lat, E_inf, I_asym, I_sym, R, D
+        self.epi_state: str = "S"
+        self.is_infectious: bool = False
+        self.is_symptomatic: bool = False
+        self.is_detected: bool = False
+        self.is_isolated: bool = False
+
+        self.infected_by: str | None = None
+        self.infection_tick: int | None = None
+
+        self.latent_until_tick: int | None = None
+        self.presymptomatic_until_tick: int | None = None
+        self.recovery_tick: int | None = None
+        self.death_tick: int | None = None
+
     def step(self):
         if not self.is_active:
             return
-        pass
+        self.model._update_patient_infection_state(self)
 
 
 class NurseAgent(BaseHospitalAgent):
@@ -210,6 +279,8 @@ class NurseAgent(BaseHospitalAgent):
 
         self.handover_block_idx: int = -1
         self.handover_initiated_this_block: bool = False
+        
+        self.contaminated_until_tick: int | None = None
 
     def step(self):
         time_min = self.model.get_current_time_min()
@@ -456,6 +527,8 @@ class DoctorAgent(BaseHospitalAgent):
         self.handover_block_idx: int = -1
         self.handover_initiated_this_block: bool = False
 
+        self.contaminated_until_tick: int | None = None        
+
     def step(self):
         time_min = self.model.get_current_time_min()
         tick = self.model.current_tick
@@ -615,6 +688,12 @@ class HospitalContactModel(Model):
         self.agent_index: dict[str, BaseHospitalAgent] = {}
 
         self.visit_events: list[dict] = []
+        self.infection_events: list[dict] = []
+        self.seed_events: list[dict] = []
+        self._scheduled_seed_introductions: list[dict] = []
+
+        self.debug_seed_contacts: list[dict] = []
+        self.debug_new_infections: list[dict] = []
 
         self.current_tick = 0
         self.current_time_min = 0
@@ -641,6 +720,8 @@ class HospitalContactModel(Model):
         self._assign_nurse_room_caseloads()
         self._assign_doctor_panels()
         self._assign_daily_feeders()
+
+        self._schedule_initial_seed_introductions()
 
         self.daily_census_history.append(self.get_current_patient_count())
 
@@ -945,6 +1026,24 @@ class HospitalContactModel(Model):
 
         contact_pair = tuple(sorted([actor_id, target_id]))
         self._recent_contacts[contact_pair] = tick
+        if (
+            108 <= tick <= 1260
+            and (actor_id == "patient_53" or target_id == "patient_53")
+        ):
+            self.debug_seed_contacts.append(
+                {
+                    "tick": tick,
+                    "time_str": event["time_str"],
+                    "actor_id": actor_id,
+                    "actor_type": event["actor_type"],
+                    "target_id": target_id,
+                    "target_type": event["target_type"],
+                    "event_type": event_type,
+                    "duration_min": duration_min,
+                }
+            )
+
+        self._attempt_transmission_from_contact(event)
 
     def is_tick_in_block(self, tick: int, block: tuple[int, int]) -> bool:
         time_min = tick_to_time_min(tick, self.config.dt_min)
@@ -979,49 +1078,519 @@ class HospitalContactModel(Model):
         return self._feeding_block_assignments[bidx].get(nurse_id, [])
 
     # =========================================================
+    # Infection dynamics
+    # =========================================================
+    def _schedule_initial_seed_introductions(self):
+        seed_patient_id = "patient_53"
+        seed_tick = 9 * 60 // self.config.dt_min   # 09:00, nappali aktivitási időben
+
+        self._scheduled_seed_introductions = [
+            {
+                "patient_id": seed_patient_id,
+                "seed_tick": seed_tick,
+                "seed_state": "I_asym",
+            }
+        ]
+
+    def _apply_scheduled_seed_introductions(self):
+        if not self._scheduled_seed_introductions:
+            return
+
+        remaining = []
+        for item in self._scheduled_seed_introductions:
+            if item["seed_tick"] != self.current_tick:
+                remaining.append(item)
+                continue
+
+            patient = self.agent_index.get(item["patient_id"])
+            if isinstance(patient, PatientAgent) and patient.is_active and patient.epi_state == "S":
+                self._force_seed_patient_as_e_inf(patient)
+
+        self._scheduled_seed_introductions = remaining
+
+    def _force_seed_patient_as_e_inf(self, patient: PatientAgent):
+        patient.epi_state = "I_asym"
+        patient.is_infectious = True
+        patient.is_symptomatic = False
+        patient.is_detected = False
+        patient.is_isolated = False
+
+        patient.infected_by = "seed"
+        patient.infection_tick = self.current_tick
+        patient.latent_until_tick = None
+        patient.presymptomatic_until_tick = None
+
+        recovery_days = max(
+            4.0,
+            sample_gamma_days(
+                self.rng,
+                self.config.recovery_asym_shape,
+                self.config.recovery_asym_scale_days,
+            )
+        )
+        patient.recovery_tick = self.current_tick + days_to_ticks(
+            recovery_days,
+            self.config.dt_min,
+        )
+        patient.death_tick = None
+
+        event = {
+            "run_id": self.config.run_id,
+            "tick": self.current_tick,
+            "day": self.get_current_day(),
+            "time_min": tick_to_time_min(self.current_tick, self.config.dt_min),
+            "time_str": minutes_to_hhmm(tick_to_time_min(self.current_tick, self.config.dt_min)),
+            "patient_id": patient.unique_id,
+            "source_id": "seed",
+            "source_type": "seed",
+            "event_type": "seed_introduction",
+            "new_state": "I_asym",
+        }
+        self.infection_events.append(event)
+        self.seed_events.append(event)
+
+    def _is_staff_agent(self, agent: BaseHospitalAgent) -> bool:
+        return isinstance(agent, (NurseAgent, DoctorAgent))
+
+    def _is_patient_susceptible(self, agent: BaseHospitalAgent) -> bool:
+        return isinstance(agent, PatientAgent) and agent.is_active and agent.epi_state == "S"
+
+    def _is_patient_infectious(self, agent: BaseHospitalAgent) -> bool:
+        return isinstance(agent, PatientAgent) and agent.is_active and agent.epi_state in {"E_inf", "I_asym", "I_sym"}
+
+    def _is_staff_contaminated(self, staff: BaseHospitalAgent) -> bool:
+        if not self._is_staff_agent(staff):
+            return False
+        return staff.contaminated_until_tick is not None and self.current_tick < staff.contaminated_until_tick
+
+    def _clear_staff_contamination(self, staff: BaseHospitalAgent):
+        if self._is_staff_agent(staff):
+            staff.contaminated_until_tick = None
+
+    def _contaminate_staff(self, staff: BaseHospitalAgent):
+        if not self._is_staff_agent(staff):
+            return
+        duration_ticks = days_to_ticks(self.config.hcw_contamination_duration_days, self.config.dt_min)
+        staff.contaminated_until_tick = self.current_tick + duration_ticks
+
+    def _get_infectiousness_multiplier(self, patient: PatientAgent) -> float:
+        if patient.epi_state == "E_inf":
+            return self.config.e_inf_relative_infectiousness
+        if patient.epi_state == "I_asym":
+            return self.config.i_asym_relative_infectiousness
+        if patient.epi_state == "I_sym":
+            return self.config.i_sym_relative_infectiousness
+        return 0.0
+
+    def _get_effective_transmission_prob(
+        self,
+        base_beta_per_5min: float,
+        duration_min: int,
+        infectiousness_multiplier: float = 1.0,
+        isolation_multiplier: float = 1.0,
+    ) -> float:
+        n_units = max(1.0, duration_min / self.config.dt_min)
+        beta_eff = base_beta_per_5min * infectiousness_multiplier * isolation_multiplier
+        beta_eff = min(max(beta_eff, 0.0), 1.0)
+        return 1.0 - ((1.0 - beta_eff) ** n_units)
+
+    def _infect_patient_from_contact(
+        self,
+        patient: PatientAgent,
+        source_id: str,
+        source_type: str,
+        event_type: str,
+    ):
+        if not patient.is_active:
+            return
+        if patient.epi_state != "S":
+            return
+        self.debug_new_infections.append(
+            {
+                "tick": self.current_tick,
+                "patient_id": patient.unique_id,
+                "source_id": source_id,
+                "source_type": source_type,
+                "event_type": event_type,
+            }
+        )
+        patient.epi_state = "E_lat"
+        patient.is_infectious = False
+        patient.is_symptomatic = False
+        patient.is_detected = False
+        patient.is_isolated = False
+
+        patient.infected_by = source_id
+        patient.infection_tick = self.current_tick
+
+        latent_days = sample_gamma_days(
+            self.rng,
+            self.config.latent_shape,
+            self.config.latent_scale_days,
+        )
+        patient.latent_until_tick = self.current_tick + days_to_ticks(latent_days, self.config.dt_min)
+        patient.presymptomatic_until_tick = None
+        patient.recovery_tick = None
+        patient.death_tick = None
+
+        self.infection_events.append(
+            {
+                "run_id": self.config.run_id,
+                "tick": self.current_tick,
+                "day": self.get_current_day(),
+                "time_min": tick_to_time_min(self.current_tick, self.config.dt_min),
+                "time_str": minutes_to_hhmm(tick_to_time_min(self.current_tick, self.config.dt_min)),
+                "patient_id": patient.unique_id,
+                "source_id": source_id,
+                "source_type": source_type,
+                "event_type": event_type,
+                "new_state": "E_lat",
+            }
+        )
+
+    def _update_patient_infection_state(self, patient: PatientAgent):
+        tick = self.current_tick
+
+        if patient.epi_state == "E_lat":
+            if patient.latent_until_tick is not None and tick >= patient.latent_until_tick:
+                self._progress_e_lat_to_e_inf(patient)
+                return
+
+        if patient.epi_state == "E_inf":
+            if patient.presymptomatic_until_tick is not None and tick >= patient.presymptomatic_until_tick:
+                self._progress_e_inf_to_i_state(patient)
+                return
+
+        if patient.epi_state in {"I_asym", "I_sym"}:
+            if patient.death_tick is not None and tick >= patient.death_tick:
+                self._process_patient_death(patient)
+                return
+
+            if patient.recovery_tick is not None and tick >= patient.recovery_tick:
+                self._process_patient_recovery(patient)
+                return
+
+    def _progress_e_lat_to_e_inf(self, patient: PatientAgent):
+        if not patient.is_active or patient.epi_state != "E_lat":
+            return
+
+        patient.epi_state = "E_inf"
+        patient.is_infectious = True
+        patient.is_symptomatic = False
+        patient.is_detected = False
+        patient.is_isolated = False
+        patient.latent_until_tick = None
+
+        presymptomatic_days = sample_gamma_days(
+            self.rng,
+            self.config.presymptomatic_shape,
+            self.config.presymptomatic_scale_days,
+        )
+        patient.presymptomatic_until_tick = self.current_tick + days_to_ticks(
+            presymptomatic_days,
+            self.config.dt_min,
+        )
+
+        self.infection_events.append(
+            {
+                "run_id": self.config.run_id,
+                "tick": self.current_tick,
+                "day": self.get_current_day(),
+                "time_min": tick_to_time_min(self.current_tick, self.config.dt_min),
+                "time_str": minutes_to_hhmm(tick_to_time_min(self.current_tick, self.config.dt_min)),
+                "patient_id": patient.unique_id,
+                "source_id": patient.infected_by,
+                "source_type": "progression",
+                "event_type": "state_transition",
+                "new_state": "E_inf",
+            }
+        )
+
+    def _progress_e_inf_to_i_state(self, patient: PatientAgent):
+        if not patient.is_active or patient.epi_state != "E_inf":
+            return
+
+        patient.presymptomatic_until_tick = None
+
+        symptomatic = self.rng.random() < self.config.p_symptomatic
+        if symptomatic:
+            patient.epi_state = "I_sym"
+            patient.is_infectious = True
+            patient.is_symptomatic = True
+            patient.is_detected = False
+            patient.is_isolated = False
+
+            recovery_days = max(
+                2.0,
+                sample_gamma_days(
+                    self.rng,
+                    self.config.recovery_asym_shape,
+                    self.config.recovery_asym_scale_days,
+                )
+            )
+            patient.recovery_tick = self.current_tick + days_to_ticks(recovery_days, self.config.dt_min)
+
+            if self.rng.random() < self.config.infection_fatality_ratio:
+                death_days = sample_gamma_days(
+                    self.rng,
+                    self.config.death_shape,
+                    self.config.death_scale_days,
+                )
+                patient.death_tick = self.current_tick + days_to_ticks(death_days, self.config.dt_min)
+            else:
+                patient.death_tick = None
+
+            new_state = "I_sym"
+        else:
+            patient.epi_state = "I_asym"
+            patient.is_infectious = True
+            patient.is_symptomatic = False
+            patient.is_detected = False
+            patient.is_isolated = False
+
+            recovery_days = max(
+                3.0,
+                sample_gamma_days(
+                    self.rng,
+                    self.config.recovery_sym_shape,
+                    self.config.recovery_sym_scale_days,
+                )
+            )
+            patient.recovery_tick = self.current_tick + days_to_ticks(recovery_days, self.config.dt_min)
+            patient.death_tick = None
+            new_state = "I_asym"
+
+        self.infection_events.append(
+            {
+                "run_id": self.config.run_id,
+                "tick": self.current_tick,
+                "day": self.get_current_day(),
+                "time_min": tick_to_time_min(self.current_tick, self.config.dt_min),
+                "time_str": minutes_to_hhmm(tick_to_time_min(self.current_tick, self.config.dt_min)),
+                "patient_id": patient.unique_id,
+                "source_id": patient.infected_by,
+                "source_type": "progression",
+                "event_type": "state_transition",
+                "new_state": new_state,
+            }
+        )
+
+    def _process_patient_recovery(self, patient: PatientAgent):
+        if not patient.is_active:
+            return
+
+        patient.epi_state = "R"
+        patient.is_infectious = False
+        patient.is_symptomatic = False
+        patient.is_detected = False
+        patient.is_isolated = False
+        patient.latent_until_tick = None
+        patient.presymptomatic_until_tick = None
+        patient.recovery_tick = None
+        patient.death_tick = None
+
+        self.infection_events.append(
+            {
+                "run_id": self.config.run_id,
+                "tick": self.current_tick,
+                "day": self.get_current_day(),
+                "time_min": tick_to_time_min(self.current_tick, self.config.dt_min),
+                "time_str": minutes_to_hhmm(tick_to_time_min(self.current_tick, self.config.dt_min)),
+                "patient_id": patient.unique_id,
+                "source_id": patient.infected_by,
+                "source_type": "progression",
+                "event_type": "state_transition",
+                "new_state": "R",
+            }
+        )
+
+    def _process_patient_death(self, patient: PatientAgent):
+        if not patient.is_active:
+            return
+
+        patient.epi_state = "D"
+        patient.is_infectious = False
+        patient.is_symptomatic = False
+        patient.is_detected = False
+        patient.is_isolated = False
+
+        self.infection_events.append(
+            {
+                "run_id": self.config.run_id,
+                "tick": self.current_tick,
+                "day": self.get_current_day(),
+                "time_min": tick_to_time_min(self.current_tick, self.config.dt_min),
+                "time_str": minutes_to_hhmm(tick_to_time_min(self.current_tick, self.config.dt_min)),
+                "patient_id": patient.unique_id,
+                "source_id": patient.infected_by,
+                "source_type": "progression",
+                "event_type": "state_transition",
+                "new_state": "D",
+            }
+        )
+
+        self._discharge_patient(patient)
+
+    def _attempt_transmission_from_contact(self, event: dict):
+        print("TRANSMISSION CALLED", event["event_type"])
+        actor = self.agent_index[event["actor_id"]]
+        target = self.agent_index[event["target_id"]]
+        duration_min = int(event["duration_min"])
+        event_type = event["event_type"]
+        if (
+            57 <= self.current_tick <= 633
+            and (
+                event["actor_id"] == "patient_53"
+                or event["target_id"] == "patient_53"
+            )
+        ):
+            print(
+                "INFECTIOUS WINDOW DEBUG |",
+                f"tick={self.current_tick}",
+                f"event={event_type}",
+                f"actor={event['actor_id']}",
+                f"actor_state={getattr(actor, 'epi_state', 'NA')}",
+                f"actor_inf={getattr(actor, 'is_infectious', 'NA')}",
+                f"target={event['target_id']}",
+                f"target_state={getattr(target, 'epi_state', 'NA')}",
+                f"target_inf={getattr(target, 'is_infectious', 'NA')}",
+                f"duration={duration_min}",
+            )
+
+        # patient-patient direct transmission
+        if isinstance(actor, PatientAgent) and isinstance(target, PatientAgent):
+            if self._is_patient_infectious(actor) and self._is_patient_susceptible(target):
+                infectiousness = self._get_infectiousness_multiplier(actor)
+                isolation_multiplier = (
+                    self.config.isolation_transmission_multiplier
+                    if (actor.is_isolated or target.is_isolated)
+                    else 1.0
+                )
+                p = self._get_effective_transmission_prob(
+                    self.config.beta_patient_patient_per_5min,
+                    duration_min,
+                    infectiousness_multiplier=infectiousness,
+                    isolation_multiplier=isolation_multiplier,
+                )
+                if actor.unique_id == "patient_53" or target.unique_id == "patient_53":
+                    print(
+                        "PP CHECK |",
+                        f"tick={self.current_tick}",
+                        f"actor={actor.unique_id}",
+                        f"actor_state={actor.epi_state}",
+                        f"actor_inf={actor.is_infectious}",
+                        f"target={target.unique_id}",
+                        f"target_state={target.epi_state}",
+                        f"target_inf={target.is_infectious}",
+                        f"duration={duration_min}",
+                        f"p={p:.4f}",
+                    )
+                if self.rng.random() < p:
+                    self._infect_patient_from_contact(
+                        target,
+                        source_id=actor.unique_id,
+                        source_type=actor.agent_type,
+                        event_type=event_type,
+                    )
+
+            elif self._is_patient_infectious(target) and self._is_patient_susceptible(actor):
+                infectiousness = self._get_infectiousness_multiplier(target)
+                isolation_multiplier = (
+                    self.config.isolation_transmission_multiplier
+                    if (actor.is_isolated or target.is_isolated)
+                    else 1.0
+                )
+                p = self._get_effective_transmission_prob(
+                    self.config.beta_patient_patient_per_5min,
+                    duration_min,
+                    infectiousness_multiplier=infectiousness,
+                    isolation_multiplier=isolation_multiplier,
+                )
+                if target.unique_id == "patient_53" or actor.unique_id == "patient_53":
+                    print(
+                        "PP CHECK |",
+                        f"tick={self.current_tick}",
+                        f"actor={actor.unique_id}",
+                        f"actor_state={actor.epi_state}",
+                        f"actor_inf={actor.is_infectious}",
+                        f"target={target.unique_id}",
+                        f"target_state={target.epi_state}",
+                        f"target_inf={target.is_infectious}",
+                        f"duration={duration_min}",
+                        f"p={p:.4f}",
+                    )
+                if self.rng.random() < p:
+                    self._infect_patient_from_contact(
+                        actor,
+                        source_id=target.unique_id,
+                        source_type=target.agent_type,
+                        event_type=event_type,
+                    )
+            return
+
+        # staff-patient contact via transient staff contamination
+        if self._is_staff_agent(actor) and isinstance(target, PatientAgent):
+            staff = actor
+            patient = target
+
+            # infectious patient contaminates staff
+            if self._is_patient_infectious(patient):
+                infectiousness = self._get_infectiousness_multiplier(patient)
+                isolation_multiplier = self.config.isolation_transmission_multiplier if patient.is_isolated else 1.0
+                p_contam = self._get_effective_transmission_prob(
+                    self.config.beta_patient_to_hcw_per_5min,
+                    duration_min,
+                    infectiousness_multiplier=infectiousness,
+                    isolation_multiplier=isolation_multiplier,
+                )
+                if self.rng.random() < p_contam:
+                    self._contaminate_staff(staff)
+
+            # contaminated staff infects susceptible patient
+            elif self._is_staff_contaminated(staff) and self._is_patient_susceptible(patient):
+                isolation_multiplier = self.config.isolation_transmission_multiplier if patient.is_isolated else 1.0
+                p_trans = self._get_effective_transmission_prob(
+                    self.config.beta_hcw_to_patient_per_5min,
+                    duration_min,
+                    infectiousness_multiplier=1.0,
+                    isolation_multiplier=isolation_multiplier,
+                )
+                if self.rng.random() < p_trans:
+                    self._infect_patient_from_contact(
+                        patient,
+                        source_id=staff.unique_id,
+                        source_type=staff.agent_type,
+                        event_type=event_type,
+                    )
+
+            # hand hygiene can clear staff contamination after patient contact
+            if self._is_staff_contaminated(staff):
+                if self.rng.random() < self.config.hand_hygiene_clearance_prob_after_patient_contact:
+                    self._clear_staff_contamination(staff)
+
+
+    # =========================================================
     # Model-level event generation
     # =========================================================
     def _generate_roommate_events(self, tick: int, time_min: int):
-        if time_min % 60 != 0:
-            return
-
-        hour_idx = time_min // 60
-        day_idx = self.get_current_day()
-
         for room_id, occupants in self.room_occupants.items():
             active_occupants = [pid for pid in occupants if self.is_patient_active(pid)]
+
             if len(active_occupants) < 2:
                 continue
 
-            # FIX 8:
-            # day-aware kulcs
-            key = (room_id, day_idx, hour_idx)
-            if key in self._room_hour_triggered:
-                continue
+            for i in range(len(active_occupants)):
+                for j in range(i + 1, len(active_occupants)):
+                    p1 = active_occupants[i]
+                    p2 = active_occupants[j]
 
-            if self.rng.random() < self.config.p_roommate_event_per_room_per_hour:
-                p1, p2 = self.rng.sample(active_occupants, k=2)
-
-                # FIX 9:
-                # roommate eseményeknél is abszolút időt használunk
-                abs_time_min = tick_to_time_min(tick, self.config.dt_min)
-
-                event = {
-                    "run_id": self.config.run_id,
-                    "tick": tick,
-                    "day": day_idx,
-                    "time_min": abs_time_min,
-                    "time_str": minutes_to_hhmm(abs_time_min),
-                    "actor_id": p1,
-                    "actor_type": "patient",
-                    "target_id": p2,
-                    "target_type": "patient",
-                    "room_id": room_id,
-                    "event_type": "roommate",
-                    "duration_min": DURATION_MIN_DEFAULT,
-                }
-                self.visit_events.append(event)
-                self._room_hour_triggered.add(key)
+                    self.record_contact(
+                        tick=tick,
+                        actor_id=p1,
+                        target_id=p2,
+                        event_type="roommate",
+                        duration_min=self.config.dt_min,
+                    )
 
     def _generate_nurse_station_events(self, tick: int, time_min: int):
         is_random_daytime_tick = (tick % self.config.ticks_per_day) in self._random_nurse_station_ticks
@@ -1047,6 +1616,8 @@ class HospitalContactModel(Model):
 
         time_min = tick_to_time_min(tick % self.config.ticks_per_day, self.config.dt_min)
         self.current_time_min = time_min
+
+        self._apply_scheduled_seed_introductions()   
 
         for patient in self.patients:
             if patient.is_active:
@@ -1202,7 +1773,14 @@ def build_run_summary(
                 "total_ND_events": int(type_counts["DN"]),
                 "total_DD_events": int(type_counts["DD"]),
                 "top5_nodes_by_degree": json.dumps(top5_degree),
-                "top5_nodes_by_weighted_degree": json.dumps(top5_wdegree),
+                "final_S": int(sum(1 for p in model.patients if p.epi_state == "S")),
+                "final_E_lat": int(sum(1 for p in model.patients if p.epi_state == "E_lat")),
+                "final_E_inf": int(sum(1 for p in model.patients if p.epi_state == "E_inf")),
+                "final_I_asym": int(sum(1 for p in model.patients if p.epi_state == "I_asym")),
+                "final_I_sym": int(sum(1 for p in model.patients if p.epi_state == "I_sym")),
+                "final_R": int(sum(1 for p in model.patients if p.epi_state == "R")),
+                "final_D": int(sum(1 for p in model.patients if p.epi_state == "D")),
+                "total_infection_events": int(len([e for e in model.infection_events if e["new_state"] in {"E_lat", "E_inf"}])),
             }
         ]
     )
@@ -1234,6 +1812,11 @@ def export_csvs(
 
     return visit_path, agg_path, summary_path
 
+def export_infection_csv(model: HospitalContactModel, run_output_dir: str) -> str:
+    infection_path = os.path.join(run_output_dir, "infection_log.csv")
+    infection_df = pd.DataFrame(model.infection_events)
+    infection_df.to_csv(infection_path, index=False)
+    return infection_path
 
 # =========================================================
 # 9) VISUALIZATION
@@ -1821,6 +2404,7 @@ def main():
 
     model, visit_df, agg_df, summary_df = run_simulation(config)
     visit_path, agg_path, summary_path = export_csvs(config, visit_df, agg_df, summary_df, run_output_dir)
+    infection_path = export_infection_csv(model, run_output_dir)
     net_path, ts_path, deg_path = export_figures(config, visit_df, agg_df, run_output_dir)
 
     analysis_paths = export_analysis_outputs(
@@ -1843,6 +2427,7 @@ def main():
     print(f"- {visit_path}")
     print(f"- {agg_path}")
     print(f"- {summary_path}")
+    print(f"- {infection_path}")
     print(f"- {net_path}")
     print(f"- {ts_path}")
     print(f"- {deg_path}")
@@ -1859,6 +2444,13 @@ def main():
     print(f"- {analysis_paths['role_pair_bar_png']}")
     print(f"- {analysis_paths['edge_weight_hist_png']}")
     print(f"- {analysis_paths['daily_flow_png']}")
+    print("\n=== DEBUG SUMMARY ===")
+    print(f"seed-window contacts involving patient_53: {len(model.debug_seed_contacts)}")
+    for row in model.debug_seed_contacts[:20]:
+        print(row)
 
+    print(f"\nnew infections created: {len(model.debug_new_infections)}")
+    for row in model.debug_new_infections[:20]:
+        print(row)
 if __name__ == "__main__":
     main()
