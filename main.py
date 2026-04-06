@@ -87,7 +87,7 @@ class SimConfig:
     target_bed_occupancy: float = 0.6829
     mean_los_days: float = 7.69
     initial_patient_count: int = 57
-    daily_admissions_mean: float = 7.37
+    #daily_admissions_mean: float = 7.37    # ez a paraméter jelenleg nincs használatban, mert a napi felvételek is a központi LOS mintavételből származnak, így implicit módon igazodnak a kimenő betegek számához
     los_distribution: str = "fixed"
     initial_remaining_los_distribution: str = "discrete_uniform_1_8"
 
@@ -117,7 +117,6 @@ class SimConfig:
     feeding_coverage_max: float = 0.50
     p_ad_hoc_tick: float = 0.20
     ad_hoc_max_events_per_tick: int = 2
-    p_roommate_event_per_room_per_hour: float = 0.50
     nurse_station_random_ticks_per_day: int = 10
 
     output_dir: str = "outputs"
@@ -125,8 +124,10 @@ class SimConfig:
     # =========================================================
     # Infection dynamics configuration
     # =========================================================
-    initial_seed_infections: int = 1
-    seed_in_first_days: int = 2
+    #initial_seed_infections: int = 1
+    #seed_in_first_days: int = 2    # ez a két paraméter együtt határozza meg, hogy hány seed fertőzés legyen a szimuláció elején,
+                                    # és hogy azok milyen gyorsan kerüljenek be (pl. 2 seed az első 2 napban, vagy 4 seed az első napban)
+                                    # de jelenleg a hardcodeolt  seedelés miatt nincsnnek használatban
 
     p_symptomatic: float = 0.60
     infection_fatality_ratio: float = 0.0104
@@ -152,9 +153,10 @@ class SimConfig:
     death_scale_days: float = 3.6045
 
     # transmission placeholders, later to calibrate
-    beta_patient_patient_per_5min: float = 0.01
-    beta_hcw_to_patient_per_5min: float = 0.02
-    beta_patient_to_hcw_per_5min: float = 0.02
+    beta_patient_patient_per_5min: float = 0.015    #szükség esetény egy gyengébb védhetőbb érték = 0.002
+    beta_hcw_to_patient_per_5min: float = 0.03      #szükség esetény egy gyengébb védhetőbb érték = 0.008
+    beta_patient_to_hcw_per_5min: float = 0.03      #szükség esetény egy gyengébb védhetőbb érték = 0.008
+                                                    #A mostani 0.015 PP mellett egy többnapos szobatársi együttfekvés nagyon gyorsan túl erős fertőzési nyomást ad
 
     # relative infectiousness by stage
     e_inf_relative_infectiousness: float = 0.80
@@ -176,6 +178,22 @@ def build_run_output_dir(base_output_dir: str, run_id: str, seed: int) -> str:
     timestamp_str = now.strftime("%Y%m%d_%H%M%S")
     run_dir_name = f"{timestamp_str}_seed{seed}_{run_id}"
     return os.path.join(base_output_dir, run_dir_name)
+
+
+def build_batch_run_output_dir(base_output_dir: str, run_number: int) -> str:
+    return os.path.join(base_output_dir, f"run_{run_number:03d}")
+
+
+def ensure_unique_output_dir(preferred_dir: str) -> str:
+    candidate_dir = preferred_dir
+    suffix = 1
+
+    while os.path.exists(candidate_dir):
+        candidate_dir = f"{preferred_dir}_{suffix:02d}"
+        suffix += 1
+
+    os.makedirs(candidate_dir, exist_ok=False)
+    return candidate_dir
 
 
 def tick_to_time_min(tick: int, dt_min: int) -> int:
@@ -692,28 +710,25 @@ class HospitalContactModel(Model):
         self.seed_events: list[dict] = []
         self._scheduled_seed_introductions: list[dict] = []
 
-        self.debug_seed_contacts: list[dict] = []
-        self.debug_new_infections: list[dict] = []
-
+        
         self.current_tick = 0
         self.current_time_min = 0
 
         self._feeding_block_assignments: dict[int, dict[str, list[str]]] = {}
-
-        # FIX 1:
-        # A roommate trigger ne csak room_id + hour legyen, mert akkor
-        # az egész 30 napban egyszer aktiválódik ugyanarra az órára.
-        # A napi resetet is megtartjuk, de biztonságosan beletesszük a nap indexet is.
-        self._room_hour_triggered: set[tuple[str, int, int]] = set()
+         
 
         self._recent_contacts: dict[tuple[str, str], int] = {}
         self._random_nurse_station_ticks = self._sample_random_nurse_station_ticks()
 
-        # Multi-day tracking
+         # Multi-day tracking
         self.total_admissions = 0
         self.total_discharges = 0
         self.daily_flow_log: list[dict] = []
         self.daily_census_history: list[int] = []
+        self.flow_log: list[dict] = []
+        self.state_snapshot_log: list[dict] = []
+        self._scheduled_discharges_by_hour: dict[tuple[int, int], list[str]] = {}
+        self._scheduled_admissions_by_hour: dict[tuple[int, int], list[str]] = {}
 
         self._init_agents()
         self._assign_patients_to_rooms_deterministic()
@@ -840,6 +855,81 @@ class HospitalContactModel(Model):
     def get_current_day(self) -> int:
         return self.current_tick // self.config.ticks_per_day
 
+    def get_current_hour(self) -> int:
+        return self.current_time_min // 60
+
+    def get_global_hour(self) -> int:
+        return self.current_tick // (60 // self.config.dt_min)
+
+    def _sample_discharge_hour(self) -> int:
+        hours = [8, 9, 10, 11, 12, 13, 14, 15, 16]
+        weights = [0.18, 0.22, 0.22, 0.18, 0.08, 0.05, 0.03, 0.02, 0.02]
+        return self.rng.choices(hours, weights=weights, k=1)[0]
+
+    def _sample_admission_hour(self) -> int:
+        hours = [8, 9, 10, 11, 12, 13, 14, 15, 16, 17]
+        weights = [0.04, 0.08, 0.12, 0.14, 0.16, 0.16, 0.12, 0.10, 0.05, 0.03]
+        return self.rng.choices(hours, weights=weights, k=1)[0]
+
+    def _apply_scheduled_flow_for_current_hour(self):
+        day = self.get_current_day()
+        hour = self.get_current_hour()
+        key = (day, hour)
+
+        census_changed = False
+
+        discharge_ids = self._scheduled_discharges_by_hour.pop(key, [])
+        for patient_id in discharge_ids:
+            patient = self.agent_index.get(patient_id)
+            if isinstance(patient, PatientAgent) and patient.is_active:
+                self._discharge_patient(patient)
+                census_changed = True
+
+        admission_ids = self._scheduled_admissions_by_hour.pop(key, [])
+        for patient_id in admission_ids:
+            patient = self.agent_index.get(patient_id)
+            if not isinstance(patient, PatientAgent):
+                continue
+            if patient.is_active:
+                continue
+
+            room_id = self._find_first_available_bed()
+            if room_id is None:
+                break
+
+            self._admit_patient(patient, room_id)
+            census_changed = True
+
+        if census_changed:
+            self._refresh_assignments_after_census_change()
+
+    def _finalize_previous_day_logs(self, completed_day: int):
+        if completed_day < 0:
+            return
+
+        admissions_completed_day = sum(
+            1 for e in self.flow_log
+            if e["day"] == completed_day and e["event"] == "admission"
+        )
+        discharges_completed_day = sum(
+            1 for e in self.flow_log
+            if e["day"] == completed_day and e["event"] == "discharge"
+        )
+
+        census_end_of_day = self.get_current_patient_count()
+        occupancy_end_of_day = census_end_of_day / self.config.ward_capacity
+
+        self.daily_census_history.append(census_end_of_day)
+        self.daily_flow_log.append(
+            {
+                "day": int(completed_day),
+                "admissions": int(admissions_completed_day),
+                "discharges": int(discharges_completed_day),
+                "census_end_of_day": int(census_end_of_day),
+                "occupancy_end_of_day": float(occupancy_end_of_day),
+            }
+        )
+
     def get_patients_in_room(self, room_id: str) -> list[str]:
         return self.room_occupants.get(room_id, [])
 
@@ -869,6 +959,8 @@ class HospitalContactModel(Model):
         return [p for p in self.patients if not p.is_active]
 
     def _discharge_patient(self, patient: PatientAgent):
+        previous_room_id = patient.room_id
+
         if patient.room_id and patient.unique_id in self.room_occupants[patient.room_id]:
             self.room_occupants[patient.room_id].remove(patient.unique_id)
 
@@ -877,6 +969,21 @@ class HospitalContactModel(Model):
         patient.admission_day = None
         patient.remaining_los_days = None
         self.total_discharges += 1
+
+        self.flow_log.append(
+            {
+                "run_id": self.config.run_id,
+                "tick": self.current_tick,
+                "day": self.get_current_day(),
+                "hour": self.get_current_hour(),
+                "global_hour": self.get_global_hour(),
+                "event": "discharge",
+                "patient_id": patient.unique_id,
+                "room_id": previous_room_id,
+                "census": self.get_current_patient_count(),
+                "occupancy": self.get_current_patient_count() / self.config.ward_capacity,
+            }
+        )
 
     def _admit_patient(self, patient: PatientAgent, room_id: str):
         patient.is_active = True
@@ -889,6 +996,21 @@ class HospitalContactModel(Model):
 
         self.room_occupants[room_id].append(patient.unique_id)
         self.total_admissions += 1
+
+        self.flow_log.append(
+            {
+                "run_id": self.config.run_id,
+                "tick": self.current_tick,
+                "day": self.get_current_day(),
+                "hour": self.get_current_hour(),
+                "global_hour": self.get_global_hour(),
+                "event": "admission",
+                "patient_id": patient.unique_id,
+                "room_id": room_id,
+                "census": self.get_current_patient_count(),
+                "occupancy": self.get_current_patient_count() / self.config.ward_capacity,
+            }
+        )
 
     def _refresh_assignments_after_census_change(self):
         for nurse in self.nurses:
@@ -911,64 +1033,58 @@ class HospitalContactModel(Model):
 
     def _run_day_boundary_update(self):
         day_idx = self.get_current_day()
-        admissions_today = 0
-        discharges_today = 0
+
+        # Az előző nap lezárása (ha van)
+        completed_day = day_idx - 1
+        self._finalize_previous_day_logs(completed_day)
 
         active_patients = [p for p in self.patients if p.is_active]
 
+        # LOS decrement továbbra is napváltáskor történik
         for patient in active_patients:
             if patient.remaining_los_days is not None:
                 patient.remaining_los_days -= 1
 
+        # Azon betegek kijelölése, akik ma elbocsáthatók lesznek
+        due_for_discharge: list[PatientAgent] = []
         for patient in list(active_patients):
             if patient.remaining_los_days is not None and patient.remaining_los_days <= 0:
-                self._discharge_patient(patient)
-                discharges_today += 1        
-        
+                due_for_discharge.append(patient)
 
-         # FIX 5:
-        # Stochastic admission szabály a target occupancy körüli visszatöltéshez.
+        # Nem bocsátjuk el őket azonnal, csak szétosztjuk órákra
+        self._scheduled_discharges_by_hour = {
+            k: v for k, v in self._scheduled_discharges_by_hour.items() if k[0] != day_idx
+        }
+        for patient in due_for_discharge:
+            discharge_hour = self._sample_discharge_hour()
+            key = (day_idx, discharge_hour)
+            self._scheduled_discharges_by_hour.setdefault(key, []).append(patient.unique_id)
+
+        # A mai felvételi igényt már a várható discharge-ok után becsüljük
         current_census = self.get_current_patient_count()
+        projected_census_after_discharges = current_census - len(due_for_discharge)
 
-        target_gap = (self.config.target_bed_occupancy * self.config.ward_capacity) - current_census
+        target_gap = (
+            self.config.target_bed_occupancy * self.config.ward_capacity
+        ) - projected_census_after_discharges
         expected_admissions = max(0.0, target_gap)
 
         daily_admissions = self._sample_poisson(expected_admissions)
 
-        available_beds = self.config.ward_capacity - current_census
-        daily_admissions = min(daily_admissions, available_beds)
+        available_beds_after_discharges = self.config.ward_capacity - projected_census_after_discharges
+        daily_admissions = min(daily_admissions, available_beds_after_discharges)
 
         inactive_pool = self._get_inactive_patients_pool()
 
-        for patient in inactive_pool:
-            if daily_admissions <= 0:
-                break
-            room_id = self._find_first_available_bed()
-            if room_id is None:
-                break
-            self._admit_patient(patient, room_id)
-            admissions_today += 1
-            daily_admissions -= 1
-                
+        self._scheduled_admissions_by_hour = {
+            k: v for k, v in self._scheduled_admissions_by_hour.items() if k[0] != day_idx
+        }
 
-        # FIX 6:
-        # napi reset a roommate triggerhez
-        self._room_hour_triggered.clear()
-
-        self._refresh_assignments_after_census_change()
-
-        census_end_of_day = self.get_current_patient_count()
-        self.daily_census_history.append(census_end_of_day)
-
-        self.daily_flow_log.append(
-            {
-                "day": int(day_idx),
-                "admissions": int(admissions_today),
-                "discharges": int(discharges_today),
-                "census_end_of_day": int(census_end_of_day),
-                "occupancy_end_of_day": float(census_end_of_day / self.config.ward_capacity),
-            }
-        )        
+        selected_patients = inactive_pool[:daily_admissions]
+        for patient in selected_patients:
+            admission_hour = self._sample_admission_hour()
+            key = (day_idx, admission_hour)
+            self._scheduled_admissions_by_hour.setdefault(key, []).append(patient.unique_id) 
         
     def _sample_contact_duration(self, event_type: str, actor_type: str, target_type: str) -> int:
         if actor_type == "nurse" and target_type == "patient":
@@ -1026,23 +1142,7 @@ class HospitalContactModel(Model):
 
         contact_pair = tuple(sorted([actor_id, target_id]))
         self._recent_contacts[contact_pair] = tick
-        if (
-            108 <= tick <= 1260
-            and (actor_id == "patient_53" or target_id == "patient_53")
-        ):
-            self.debug_seed_contacts.append(
-                {
-                    "tick": tick,
-                    "time_str": event["time_str"],
-                    "actor_id": actor_id,
-                    "actor_type": event["actor_type"],
-                    "target_id": target_id,
-                    "target_type": event["target_type"],
-                    "event_type": event_type,
-                    "duration_min": duration_min,
-                }
-            )
-
+        
         self._attempt_transmission_from_contact(event)
 
     def is_tick_in_block(self, tick: int, block: tuple[int, int]) -> bool:
@@ -1104,11 +1204,11 @@ class HospitalContactModel(Model):
 
             patient = self.agent_index.get(item["patient_id"])
             if isinstance(patient, PatientAgent) and patient.is_active and patient.epi_state == "S":
-                self._force_seed_patient_as_e_inf(patient)
+                self._force_seed_patient_as_i_asym(patient)
 
         self._scheduled_seed_introductions = remaining
 
-    def _force_seed_patient_as_e_inf(self, patient: PatientAgent):
+    def _force_seed_patient_as_i_asym(self, patient: PatientAgent):
         patient.epi_state = "I_asym"
         patient.is_infectious = True
         patient.is_symptomatic = False
@@ -1205,15 +1305,7 @@ class HospitalContactModel(Model):
             return
         if patient.epi_state != "S":
             return
-        self.debug_new_infections.append(
-            {
-                "tick": self.current_tick,
-                "patient_id": patient.unique_id,
-                "source_id": source_id,
-                "source_type": source_type,
-                "event_type": event_type,
-            }
-        )
+        
         patient.epi_state = "E_lat"
         patient.is_infectious = False
         patient.is_symptomatic = False
@@ -1321,11 +1413,11 @@ class HospitalContactModel(Model):
             patient.is_isolated = False
 
             recovery_days = max(
-                2.0,
+                3.0,
                 sample_gamma_days(
                     self.rng,
-                    self.config.recovery_asym_shape,
-                    self.config.recovery_asym_scale_days,
+                    self.config.recovery_sym_shape,
+                    self.config.recovery_sym_scale_days,
                 )
             )
             patient.recovery_tick = self.current_tick + days_to_ticks(recovery_days, self.config.dt_min)
@@ -1349,11 +1441,11 @@ class HospitalContactModel(Model):
             patient.is_isolated = False
 
             recovery_days = max(
-                3.0,
+                2.0,
                 sample_gamma_days(
                     self.rng,
-                    self.config.recovery_sym_shape,
-                    self.config.recovery_sym_scale_days,
+                    self.config.recovery_asym_shape,
+                    self.config.recovery_asym_scale_days,
                 )
             )
             patient.recovery_tick = self.current_tick + days_to_ticks(recovery_days, self.config.dt_min)
@@ -1432,31 +1524,11 @@ class HospitalContactModel(Model):
         self._discharge_patient(patient)
 
     def _attempt_transmission_from_contact(self, event: dict):
-        print("TRANSMISSION CALLED", event["event_type"])
         actor = self.agent_index[event["actor_id"]]
         target = self.agent_index[event["target_id"]]
         duration_min = int(event["duration_min"])
         event_type = event["event_type"]
-        if (
-            57 <= self.current_tick <= 633
-            and (
-                event["actor_id"] == "patient_53"
-                or event["target_id"] == "patient_53"
-            )
-        ):
-            print(
-                "INFECTIOUS WINDOW DEBUG |",
-                f"tick={self.current_tick}",
-                f"event={event_type}",
-                f"actor={event['actor_id']}",
-                f"actor_state={getattr(actor, 'epi_state', 'NA')}",
-                f"actor_inf={getattr(actor, 'is_infectious', 'NA')}",
-                f"target={event['target_id']}",
-                f"target_state={getattr(target, 'epi_state', 'NA')}",
-                f"target_inf={getattr(target, 'is_infectious', 'NA')}",
-                f"duration={duration_min}",
-            )
-
+        
         # patient-patient direct transmission
         if isinstance(actor, PatientAgent) and isinstance(target, PatientAgent):
             if self._is_patient_infectious(actor) and self._is_patient_susceptible(target):
@@ -1472,19 +1544,7 @@ class HospitalContactModel(Model):
                     infectiousness_multiplier=infectiousness,
                     isolation_multiplier=isolation_multiplier,
                 )
-                if actor.unique_id == "patient_53" or target.unique_id == "patient_53":
-                    print(
-                        "PP CHECK |",
-                        f"tick={self.current_tick}",
-                        f"actor={actor.unique_id}",
-                        f"actor_state={actor.epi_state}",
-                        f"actor_inf={actor.is_infectious}",
-                        f"target={target.unique_id}",
-                        f"target_state={target.epi_state}",
-                        f"target_inf={target.is_infectious}",
-                        f"duration={duration_min}",
-                        f"p={p:.4f}",
-                    )
+                
                 if self.rng.random() < p:
                     self._infect_patient_from_contact(
                         target,
@@ -1506,19 +1566,7 @@ class HospitalContactModel(Model):
                     infectiousness_multiplier=infectiousness,
                     isolation_multiplier=isolation_multiplier,
                 )
-                if target.unique_id == "patient_53" or actor.unique_id == "patient_53":
-                    print(
-                        "PP CHECK |",
-                        f"tick={self.current_tick}",
-                        f"actor={actor.unique_id}",
-                        f"actor_state={actor.epi_state}",
-                        f"actor_inf={actor.is_infectious}",
-                        f"target={target.unique_id}",
-                        f"target_state={target.epi_state}",
-                        f"target_inf={target.is_infectious}",
-                        f"duration={duration_min}",
-                        f"p={p:.4f}",
-                    )
+                
                 if self.rng.random() < p:
                     self._infect_patient_from_contact(
                         actor,
@@ -1572,7 +1620,7 @@ class HospitalContactModel(Model):
     # =========================================================
     # Model-level event generation
     # =========================================================
-    def _generate_roommate_events(self, tick: int, time_min: int):
+    def _generate_roommate_events(self, tick: int, _time_min: int):
         for room_id, occupants in self.room_occupants.items():
             active_occupants = [pid for pid in occupants if self.is_patient_active(pid)]
 
@@ -1617,6 +1665,9 @@ class HospitalContactModel(Model):
         time_min = tick_to_time_min(tick % self.config.ticks_per_day, self.config.dt_min)
         self.current_time_min = time_min
 
+        if time_min % 60 == 0:
+            self._apply_scheduled_flow_for_current_hour()
+
         self._apply_scheduled_seed_introductions()   
 
         for patient in self.patients:
@@ -1632,6 +1683,33 @@ class HospitalContactModel(Model):
         self._generate_roommate_events(tick, time_min)
         self._generate_nurse_station_events(tick, time_min)
 
+        ticks_per_hour = 60 // self.config.dt_min
+        if (tick + 1) % ticks_per_hour == 0:
+            active_cases = sum(
+                1 for p in self.patients
+                if p.is_active and p.epi_state in {"E_inf", "I_asym", "I_sym"}
+            )
+
+            self.state_snapshot_log.append(
+                {
+                    "run_id": self.config.run_id,
+                    "tick": tick + 1,
+                    "day": self.get_current_day(),
+                    "hour": (((tick + 1) % self.config.ticks_per_day) // ticks_per_hour) % 24,
+                    "global_hour": (tick + 1) // ticks_per_hour,
+                    "S": int(sum(1 for p in self.patients if p.is_active and p.epi_state == "S")),
+                    "E_lat": int(sum(1 for p in self.patients if p.is_active and p.epi_state == "E_lat")),
+                    "E_inf": int(sum(1 for p in self.patients if p.is_active and p.epi_state == "E_inf")),
+                    "I_asym": int(sum(1 for p in self.patients if p.is_active and p.epi_state == "I_asym")),
+                    "I_sym": int(sum(1 for p in self.patients if p.is_active and p.epi_state == "I_sym")),
+                    "R": int(sum(1 for p in self.patients if p.is_active and p.epi_state == "R")),
+                    "D": int(sum(1 for p in self.patients if p.epi_state == "D")),
+                    "active_cases": int(active_cases),
+                    "census": int(self.get_current_patient_count()),
+                    "occupancy": float(self.get_current_patient_count() / self.config.ward_capacity),
+                }
+            )
+
         self.current_tick += 1
 
 
@@ -1645,6 +1723,8 @@ def run_simulation(config: SimConfig) -> tuple[HospitalContactModel, pd.DataFram
     total_ticks = config.ticks_per_day * config.simulation_days
     for _ in range(total_ticks):
         model.step()
+
+    model._finalize_previous_day_logs(config.simulation_days - 1)
 
     visit_df = pd.DataFrame(model.visit_events)
 
@@ -1666,6 +1746,57 @@ def run_simulation(config: SimConfig) -> tuple[HospitalContactModel, pd.DataFram
 
     summary_df = build_run_summary(config, model, visit_df, agg_df)
     return model, visit_df, agg_df, summary_df
+
+
+def run_single_simulation(
+    config: SimConfig,
+    run_output_dir: str,
+    save_visit_log: bool = True,
+    generate_figures: bool = True,
+) -> dict[str, object]:
+    model, visit_df, agg_df, summary_df = run_simulation(config)
+
+    csv_paths = export_csvs(
+        config=config,
+        visit_df=visit_df,
+        agg_df=agg_df,
+        summary_df=summary_df,
+        run_output_dir=run_output_dir,
+        include_visit_log=save_visit_log,
+    )
+    infection_path = export_infection_csv(model, run_output_dir)
+    flow_path = export_flow_csv(model, run_output_dir)
+    state_snapshot_path = export_state_snapshot_csv(model, run_output_dir)
+    metadata_path = export_run_metadata(config, run_output_dir)
+
+    analysis_paths = export_analysis_outputs(
+        config=config,
+        model=model,
+        visit_df=visit_df,
+        agg_df=agg_df,
+        summary_df=summary_df,
+        run_output_dir=run_output_dir,
+        generate_figures=generate_figures,
+    )
+
+    figure_paths: dict[str, str] = {}
+    if generate_figures:
+        figure_paths = export_figures(config, visit_df, agg_df, run_output_dir)
+
+    return {
+        "model": model,
+        "visit_df": visit_df,
+        "agg_df": agg_df,
+        "summary_df": summary_df,
+        "csv_paths": csv_paths,
+        "infection_path": infection_path,
+        "flow_path": flow_path,
+        "state_snapshot_path": state_snapshot_path,
+        "metadata_path": metadata_path,
+        "analysis_paths": analysis_paths,
+        "figure_paths": figure_paths,
+        "run_output_dir": run_output_dir,
+    }
 
 
 # =========================================================
@@ -1796,6 +1927,7 @@ def export_csvs(
     agg_df: pd.DataFrame,
     summary_df: pd.DataFrame,
     run_output_dir: str | None = None,
+    include_visit_log: bool = True,
 ):
     if run_output_dir is None:
         run_output_dir = config.output_dir
@@ -1806,17 +1938,85 @@ def export_csvs(
     agg_path = os.path.join(run_output_dir, "aggregated_edges.csv")
     summary_path = os.path.join(run_output_dir, "run_summary.csv")
 
-    visit_df.to_csv(visit_path, index=False)
+    if include_visit_log:
+        visit_df.to_csv(visit_path, index=False)
+    else:
+        visit_path = None
     agg_df.to_csv(agg_path, index=False)
     summary_df.to_csv(summary_path, index=False)
 
-    return visit_path, agg_path, summary_path
+    return {
+        "visit_log_csv": visit_path,
+        "aggregated_edges_csv": agg_path,
+        "run_summary_csv": summary_path,
+    }
 
 def export_infection_csv(model: HospitalContactModel, run_output_dir: str) -> str:
     infection_path = os.path.join(run_output_dir, "infection_log.csv")
     infection_df = pd.DataFrame(model.infection_events)
     infection_df.to_csv(infection_path, index=False)
     return infection_path
+
+def export_flow_csv(model: HospitalContactModel, run_output_dir: str) -> str:
+    flow_path = os.path.join(run_output_dir, "flow_log.csv")
+    flow_df = pd.DataFrame(model.flow_log)
+    flow_df.to_csv(flow_path, index=False)
+    return flow_path
+
+
+def export_state_snapshot_csv(model: HospitalContactModel, run_output_dir: str) -> str:
+    snapshot_path = os.path.join(run_output_dir, "state_snapshot.csv")
+    snapshot_df = pd.DataFrame(model.state_snapshot_log)
+    snapshot_df.to_csv(snapshot_path, index=False)
+    return snapshot_path
+
+
+def export_run_metadata(config: SimConfig, run_output_dir: str) -> str:
+    metadata_path = os.path.join(run_output_dir, "run_metadata.json")
+
+    metadata = {
+        "run_id": config.run_id,
+        "seed": config.seed,
+        "dt_min": config.dt_min,
+        "ticks_per_day": config.ticks_per_day,
+        "simulation_days": config.simulation_days,
+        "ward_capacity": config.ward_capacity,
+        "n_patients_capacity": config.n_patients,
+        "n_nurses": config.n_nurses,
+        "n_doctors": config.n_doctors,
+        "n_rooms": config.n_rooms,
+        "initial_patient_count": config.initial_patient_count,
+        "target_bed_occupancy": config.target_bed_occupancy,
+        "mean_los_days": config.mean_los_days,
+        "los_distribution": config.los_distribution,
+        "initial_remaining_los_distribution": config.initial_remaining_los_distribution,
+        "p_symptomatic": config.p_symptomatic,
+        "infection_fatality_ratio": config.infection_fatality_ratio,
+        "latent_shape": config.latent_shape,
+        "latent_scale_days": config.latent_scale_days,
+        "presymptomatic_shape": config.presymptomatic_shape,
+        "presymptomatic_scale_days": config.presymptomatic_scale_days,
+        "recovery_asym_shape": config.recovery_asym_shape,
+        "recovery_asym_scale_days": config.recovery_asym_scale_days,
+        "recovery_sym_shape": config.recovery_sym_shape,
+        "recovery_sym_scale_days": config.recovery_sym_scale_days,
+        "death_shape": config.death_shape,
+        "death_scale_days": config.death_scale_days,
+        "beta_patient_patient_per_5min": config.beta_patient_patient_per_5min,
+        "beta_hcw_to_patient_per_5min": config.beta_hcw_to_patient_per_5min,
+        "beta_patient_to_hcw_per_5min": config.beta_patient_to_hcw_per_5min,
+        "e_inf_relative_infectiousness": config.e_inf_relative_infectiousness,
+        "i_asym_relative_infectiousness": config.i_asym_relative_infectiousness,
+        "i_sym_relative_infectiousness": config.i_sym_relative_infectiousness,
+        "isolation_transmission_multiplier": config.isolation_transmission_multiplier,
+        "hcw_contamination_duration_days": config.hcw_contamination_duration_days,
+        "hand_hygiene_clearance_prob_after_patient_contact": config.hand_hygiene_clearance_prob_after_patient_contact,
+    }
+
+    with open(metadata_path, "w", encoding="utf-8") as f:
+        json.dump(metadata, f, indent=2)
+
+    return metadata_path
 
 # =========================================================
 # 9) VISUALIZATION
@@ -1944,7 +2144,11 @@ def export_figures(config: SimConfig, visit_df: pd.DataFrame, agg_df: pd.DataFra
     plot_timeseries(config, visit_df, timeseries_path)
     plot_degree_hist(config, agg_df, degree_hist_path)
 
-    return network_path, timeseries_path, degree_hist_path
+    return {
+        "network_png": network_path,
+        "timeseries_png": timeseries_path,
+        "degree_hist_png": degree_hist_path,
+    }
 
 # =========================================================
 # 9/B) OUTPUT ANALYSIS
@@ -2326,22 +2530,20 @@ def export_analysis_outputs(
     agg_df: pd.DataFrame,
     summary_df: pd.DataFrame,
     run_output_dir: str,
+    generate_figures: bool = True,
 ):
-    analysis_dir = os.path.join(run_output_dir, "analysis")
-    os.makedirs(analysis_dir, exist_ok=True)
-
     ts_df = build_daily_timeseries_dataset(config, visit_df)
     role_pair_summary_df, role_pair_matrix_counts_df, role_pair_matrix_ratios_df = build_role_pair_tables(visit_df)
     degree_node_df, degree_role_df = build_degree_tables(agg_df)
     daily_flow_df = build_daily_flow_dataframe(model)    
     
-    ts_path = os.path.join(analysis_dir, "timeseries_daily.csv")
-    role_pair_summary_path = os.path.join(analysis_dir, "role_pair_summary.csv")
-    role_pair_counts_path = os.path.join(analysis_dir, "role_pair_matrix_counts.csv")
-    role_pair_ratios_path = os.path.join(analysis_dir, "role_pair_matrix_ratios.csv")
-    degree_node_path = os.path.join(analysis_dir, "degree_summary_by_node.csv")
-    degree_role_path = os.path.join(analysis_dir, "degree_summary_by_role.csv")
-    daily_flow_path = os.path.join(analysis_dir, "daily_flow.csv")
+    ts_path = os.path.join(run_output_dir, "timeseries_daily.csv")
+    role_pair_summary_path = os.path.join(run_output_dir, "role_pair_summary.csv")
+    role_pair_counts_path = os.path.join(run_output_dir, "role_pair_matrix_counts.csv")
+    role_pair_ratios_path = os.path.join(run_output_dir, "role_pair_matrix_ratios.csv")
+    degree_node_path = os.path.join(run_output_dir, "degree_summary_by_node.csv")
+    degree_role_path = os.path.join(run_output_dir, "degree_summary_by_role.csv")
+    daily_flow_path = os.path.join(run_output_dir, "daily_flow.csv")
 
     ts_df.to_csv(ts_path, index=False)
     role_pair_summary_df.to_csv(role_pair_summary_path, index=False)
@@ -2351,20 +2553,7 @@ def export_analysis_outputs(
     degree_role_df.to_csv(degree_role_path, index=False)
     daily_flow_df.to_csv(daily_flow_path, index=False)
 
-    daily_events_fig_path = os.path.join(analysis_dir, "daily_events.png")
-    daily_unique_patients_fig_path = os.path.join(analysis_dir, "daily_unique_patients.png")
-    role_pair_bar_fig_path = os.path.join(analysis_dir, "role_pair_bar.png")
-    edge_weight_hist_fig_path = os.path.join(analysis_dir, "edge_weight_hist.png")
-    daily_flow_fig_path = os.path.join(analysis_dir, "daily_flow.png")
-
-    plot_daily_events_analysis(ts_df, daily_events_fig_path)
-    plot_daily_unique_patients(ts_df, daily_unique_patients_fig_path)
-    plot_role_pair_bar(role_pair_summary_df, role_pair_bar_fig_path)
-    plot_edge_weight_histogram(agg_df, edge_weight_hist_fig_path)
-    plot_daily_flow(daily_flow_df, daily_flow_fig_path)
-
-    return {
-        "analysis_dir": analysis_dir,
+    result = {
         "timeseries_daily_csv": ts_path,
         "role_pair_summary_csv": role_pair_summary_path,
         "role_pair_matrix_counts_csv": role_pair_counts_path,
@@ -2372,19 +2561,44 @@ def export_analysis_outputs(
         "degree_summary_by_node_csv": degree_node_path,
         "degree_summary_by_role_csv": degree_role_path,
         "daily_flow_csv": daily_flow_path,
-        "daily_events_png": daily_events_fig_path,
-        "daily_unique_patients_png": daily_unique_patients_fig_path,
-        "role_pair_bar_png": role_pair_bar_fig_path,
-        "edge_weight_hist_png": edge_weight_hist_fig_path,
-        "daily_flow_png": daily_flow_fig_path,
     }
+
+    if generate_figures:
+        fig_dir = os.path.join(run_output_dir, "figures")
+        os.makedirs(fig_dir, exist_ok=True)
+
+        daily_events_fig_path = os.path.join(fig_dir, "daily_events.png")
+        daily_unique_patients_fig_path = os.path.join(fig_dir, "daily_unique_patients.png")
+        role_pair_bar_fig_path = os.path.join(fig_dir, "role_pair_bar.png")
+        edge_weight_hist_fig_path = os.path.join(fig_dir, "edge_weight_hist.png")
+        daily_flow_fig_path = os.path.join(fig_dir, "daily_flow.png")
+
+        plot_daily_events_analysis(ts_df, daily_events_fig_path)
+        plot_daily_unique_patients(ts_df, daily_unique_patients_fig_path)
+        plot_role_pair_bar(role_pair_summary_df, role_pair_bar_fig_path)
+        plot_edge_weight_histogram(agg_df, edge_weight_hist_fig_path)
+        plot_daily_flow(daily_flow_df, daily_flow_fig_path)
+
+        result.update(
+            {
+                "daily_events_png": daily_events_fig_path,
+                "daily_unique_patients_png": daily_unique_patients_fig_path,
+                "role_pair_bar_png": role_pair_bar_fig_path,
+                "edge_weight_hist_png": edge_weight_hist_fig_path,
+                "daily_flow_png": daily_flow_fig_path,
+            }
+        )
+
+    return result
 
 # =========================================================
 # 10) CLI & MAIN
 # =========================================================
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Mesa hospital contact-network prototype (no infection)")
-    parser.add_argument("--seed", type=int, default=DEFAULT_SEED, help="Random seed (default: 42)")
+    parser = argparse.ArgumentParser(description="Mesa hospital contact-network prototype with infection dynamics")
+    parser.add_argument("--seed", type=int, default=None, help="Deprecated alias for --base_seed")
+    parser.add_argument("--base_seed", type=int, default=DEFAULT_SEED, help="Base seed for reproducible runs")
+    parser.add_argument("--n_runs", type=int, default=1, help="Number of runs to execute")
     parser.add_argument(
         "--run_id",
         type=str,
@@ -2394,63 +2608,126 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def main():
-    args = parse_args()
+def resolve_base_seed(args: argparse.Namespace) -> int:
+    if args.seed is not None:
+        return args.seed
+    return args.base_seed
 
-    run_id = args.run_id or str(int(datetime.utcnow().timestamp()))
-    config = SimConfig(seed=args.seed, run_id=run_id)
 
-    run_output_dir = build_run_output_dir(config.output_dir, config.run_id, config.seed)
+def export_all_runs_summary(summary_frames: list[pd.DataFrame], base_output_dir: str) -> tuple[str, pd.DataFrame]:
+    if summary_frames:
+        all_runs_summary_df = pd.concat(summary_frames, ignore_index=True)
+    else:
+        all_runs_summary_df = pd.DataFrame(columns=["run_id", "seed"])
 
-    model, visit_df, agg_df, summary_df = run_simulation(config)
-    visit_path, agg_path, summary_path = export_csvs(config, visit_df, agg_df, summary_df, run_output_dir)
-    infection_path = export_infection_csv(model, run_output_dir)
-    net_path, ts_path, deg_path = export_figures(config, visit_df, agg_df, run_output_dir)
+    output_path = os.path.join(base_output_dir, "all_runs_summary.csv")
+    all_runs_summary_df.to_csv(output_path, index=False)
+    return output_path, all_runs_summary_df
 
-    analysis_paths = export_analysis_outputs(
-        config=config,
-        model=model,
-        visit_df=visit_df,
-        agg_df=agg_df,
-        summary_df=summary_df,
-        run_output_dir=run_output_dir,
-    )
+
+def print_single_run_report(result: dict[str, object]):
+    summary_df = result["summary_df"]
+    csv_paths = result["csv_paths"]
+    analysis_paths = result["analysis_paths"]
+    figure_paths = result["figure_paths"]
+    infection_path = result["infection_path"]
+    flow_path = result["flow_path"]
+    state_snapshot_path = result["state_snapshot_path"]
+    metadata_path = result["metadata_path"]
+    run_output_dir = result["run_output_dir"]
 
     total_events = int(summary_df.loc[0, "total_events"])
     unique_edges = int(summary_df.loc[0, "unique_edges"])
-    
+
     print("\n=== Simulation finished ===")
-    print(f"run_id={config.run_id} | seed={config.seed}")
+    print(f"run_id={summary_df.loc[0, 'run_id']} | seed={summary_df.loc[0, 'seed']}")
     print(f"total_events={total_events}, unique_edges={unique_edges}")
     print(f"\nRun-specific output directory: {run_output_dir}")
     print("\nOutput files:")
-    print(f"- {visit_path}")
-    print(f"- {agg_path}")
-    print(f"- {summary_path}")
+
+    if csv_paths["visit_log_csv"] is not None:
+        print(f"- {csv_paths['visit_log_csv']}")
+    print(f"- {csv_paths['aggregated_edges_csv']}")
+    print(f"- {csv_paths['run_summary_csv']}")
     print(f"- {infection_path}")
-    print(f"- {net_path}")
-    print(f"- {ts_path}")
-    print(f"- {deg_path}")
-    print("\nAnalysis files:")
-    print(f"- {analysis_paths['timeseries_daily_csv']}")
-    print(f"- {analysis_paths['role_pair_summary_csv']}")
-    print(f"- {analysis_paths['role_pair_matrix_counts_csv']}")
-    print(f"- {analysis_paths['role_pair_matrix_ratios_csv']}")
+    print(f"- {flow_path}")
+    print(f"- {state_snapshot_path}")
+    print(f"- {metadata_path}")
+    print(f"- {analysis_paths['daily_flow_csv']}")
     print(f"- {analysis_paths['degree_summary_by_node_csv']}")
     print(f"- {analysis_paths['degree_summary_by_role_csv']}")
-    print(f"- {analysis_paths['daily_flow_csv']}")
-    print(f"- {analysis_paths['daily_events_png']}")
-    print(f"- {analysis_paths['daily_unique_patients_png']}")
-    print(f"- {analysis_paths['role_pair_bar_png']}")
-    print(f"- {analysis_paths['edge_weight_hist_png']}")
-    print(f"- {analysis_paths['daily_flow_png']}")
-    print("\n=== DEBUG SUMMARY ===")
-    print(f"seed-window contacts involving patient_53: {len(model.debug_seed_contacts)}")
-    for row in model.debug_seed_contacts[:20]:
-        print(row)
+    print(f"- {analysis_paths['role_pair_matrix_counts_csv']}")
+    print(f"- {analysis_paths['role_pair_matrix_ratios_csv']}")
+    print(f"- {analysis_paths['role_pair_summary_csv']}")
+    print(f"- {analysis_paths['timeseries_daily_csv']}")
 
-    print(f"\nnew infections created: {len(model.debug_new_infections)}")
-    for row in model.debug_new_infections[:20]:
-        print(row)
+    if figure_paths:
+        print("\nFigure files:")
+        print(f"- {figure_paths['network_png']}")
+        print(f"- {figure_paths['timeseries_png']}")
+        print(f"- {figure_paths['degree_hist_png']}")
+        print(f"- {analysis_paths['daily_events_png']}")
+        print(f"- {analysis_paths['daily_unique_patients_png']}")
+        print(f"- {analysis_paths['role_pair_bar_png']}")
+        print(f"- {analysis_paths['edge_weight_hist_png']}")
+        print(f"- {analysis_paths['daily_flow_png']}")
+
+
+def main():
+    args = parse_args()
+    if args.n_runs < 1:
+        raise ValueError("--n_runs must be at least 1")
+
+    base_seed = resolve_base_seed(args)
+
+    if args.n_runs == 1:
+        run_id = args.run_id or str(int(datetime.utcnow().timestamp()))
+        config = SimConfig(seed=base_seed, run_id=run_id)
+        run_output_dir = ensure_unique_output_dir(
+            build_run_output_dir(config.output_dir, config.run_id, config.seed)
+        )
+
+        result = run_single_simulation(
+            config=config,
+            run_output_dir=run_output_dir,
+            save_visit_log=True,
+            generate_figures=True,
+        )
+        print_single_run_report(result)
+        return
+
+    batch_summary_frames: list[pd.DataFrame] = []
+
+    for run_index in range(args.n_runs):
+        run_number = run_index + 1
+        seed = base_seed + run_index
+        run_id = f"run_{run_number:03d}"
+        config = SimConfig(seed=seed, run_id=run_id)
+        run_output_dir = ensure_unique_output_dir(
+            build_batch_run_output_dir(config.output_dir, run_number)
+        )
+
+        print(f"Starting run {run_number}/{args.n_runs} with seed {seed}")
+
+        try:
+            result = run_single_simulation(
+                config=config,
+                run_output_dir=run_output_dir,
+                save_visit_log=False,
+                generate_figures=False,
+            )
+            batch_summary_frames.append(result["summary_df"])
+            print(f"Finished run {run_number}/{args.n_runs}")
+        except Exception as exc:
+            print(f"Run {run_number}/{args.n_runs} failed with seed {seed}: {exc}")
+            continue
+
+    all_runs_summary_path, all_runs_summary_df = export_all_runs_summary(batch_summary_frames, SimConfig().output_dir)
+
+    print("\n=== Batch execution finished ===")
+    print(f"successful_runs={len(all_runs_summary_df)}, requested_runs={args.n_runs}")
+    print(f"all_runs_summary={all_runs_summary_path}")
+    
+    
 if __name__ == "__main__":
     main()
