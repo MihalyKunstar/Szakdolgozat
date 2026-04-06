@@ -1941,7 +1941,6 @@ def run_simulation(
 def run_single_simulation(
     config: SimConfig,
     run_output_dir: str,
-    save_visit_log: bool = True,
     generate_figures: bool = True,
     stream_logs: bool = False,
 ) -> dict[str, object]:
@@ -1950,33 +1949,14 @@ def run_single_simulation(
         run_output_dir=run_output_dir,
         stream_logs=stream_logs,
     )
-    if stream_logs:
-        visit_df = pd.DataFrame(
-            columns=[
-                "run_id",
-                "tick",
-                "day",
-                "time_min",
-                "time_str",
-                "actor_id",
-                "actor_type",
-                "target_id",
-                "target_type",
-                "room_id",
-                "event_type",
-                "duration_min",
-            ]
-        )
-    else:
-        visit_df = pd.DataFrame(model.visit_events)
+
+    visit_log_path = ensure_visit_log_exists(model, run_output_dir)
 
     csv_paths = export_csvs(
         config=config,
-        visit_df=visit_df,
         agg_df=agg_df,
         summary_df=summary_df,
         run_output_dir=run_output_dir,
-        include_visit_log=save_visit_log,
     )
     infection_path = os.path.join(run_output_dir, "infection_log.csv")
     flow_path = os.path.join(run_output_dir, "flow_log.csv")
@@ -2087,13 +2067,21 @@ def build_run_summary(
 # =========================================================
 # 8) CSV EXPORT
 # =========================================================
+def ensure_visit_log_exists(model: HospitalContactModel, run_output_dir: str) -> str:
+    visit_path = os.path.join(run_output_dir, "visit_log.csv")
+
+    if os.path.exists(visit_path):
+        return visit_path
+
+    visit_df = pd.DataFrame(model.visit_events)
+    visit_df.to_csv(visit_path, index=False)
+    return visit_path
+
 def export_csvs(
     config: SimConfig,
-    visit_df: pd.DataFrame,
     agg_df: pd.DataFrame,
     summary_df: pd.DataFrame,
     run_output_dir: str | None = None,
-    include_visit_log: bool = True,
 ):
     if run_output_dir is None:
         run_output_dir = config.output_dir
@@ -2104,11 +2092,6 @@ def export_csvs(
     agg_path = os.path.join(run_output_dir, "aggregated_edges.csv")
     summary_path = os.path.join(run_output_dir, "run_summary.csv")
 
-    if include_visit_log:
-        if not os.path.exists(visit_path):
-            visit_df.to_csv(visit_path, index=False)
-    else:
-        visit_path = None
     agg_df.to_csv(agg_path, index=False)
     summary_df.to_csv(summary_path, index=False)
 
@@ -2856,8 +2839,8 @@ def print_single_run_report(result: dict[str, object]):
     print(f"\nRun-specific output directory: {run_output_dir}")
     print("\nOutput files:")
 
-    if csv_paths["visit_log_csv"] is not None:
-        print(f"- {csv_paths['visit_log_csv']}")
+    print(f"- {csv_paths['visit_log_csv']}")
+    
     print(f"- {csv_paths['aggregated_edges_csv']}")
     print(f"- {csv_paths['run_summary_csv']}")
     print(f"- {infection_path}")
@@ -2901,7 +2884,6 @@ def main():
         result = run_single_simulation(
             config=config,
             run_output_dir=run_output_dir,
-            save_visit_log=True,
             generate_figures=True,
             stream_logs=False,
         )
@@ -2929,7 +2911,6 @@ def main():
             result = run_single_simulation(
                 config=config,
                 run_output_dir=run_output_dir,
-                save_visit_log=True,
                 generate_figures=False,
                 stream_logs=True,
             )
