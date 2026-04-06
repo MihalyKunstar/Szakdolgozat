@@ -27,6 +27,7 @@ Outputs:
 # =========================================================
 
 import argparse
+import csv
 import json
 import math
 import os
@@ -180,8 +181,14 @@ def build_run_output_dir(base_output_dir: str, run_id: str, seed: int) -> str:
     return os.path.join(base_output_dir, run_dir_name)
 
 
-def build_batch_run_output_dir(base_output_dir: str, run_number: int) -> str:
-    return os.path.join(base_output_dir, f"run_{run_number:03d}")
+def build_batch_run_output_dir(batch_output_dir: str, run_number: int) -> str:
+    return os.path.join(batch_output_dir, f"run_{run_number:03d}")
+
+def build_batch_output_dir(base_output_dir: str, base_seed: int, n_runs: int) -> str:
+    now = datetime.now()
+    timestamp_str = now.strftime("%Y%m%d_%H%M%S")
+    batch_dir_name = f"{timestamp_str}_batch_seed{base_seed}_n{n_runs}"
+    return os.path.join(base_output_dir, batch_dir_name)
 
 
 def ensure_unique_output_dir(preferred_dir: str) -> str:
@@ -205,6 +212,8 @@ def minutes_to_hhmm(total_minutes: int) -> str:
     mm = total_minutes % 60
     return f"{hh:02d}:{mm:02d}"
 
+def minute_to_clock_string(total_minutes: int) -> str:
+    return minutes_to_hhmm(total_minutes)
 
 def days_to_ticks(days: float, dt_min: int) -> int:
     return max(1, int(round((days * 24 * 60) / dt_min)))
@@ -692,7 +701,12 @@ class DoctorAgent(BaseHospitalAgent):
 # 5) MESA MODEL
 # =========================================================
 class HospitalContactModel(Model):
-    def __init__(self, config: SimConfig):
+    def __init__(
+    self,
+    config: SimConfig,
+    run_output_dir: str | None = None,
+    stream_logs: bool = False,
+):
         super().__init__()
         self.config = config
         self.rng = random.Random(config.seed)
@@ -705,17 +719,32 @@ class HospitalContactModel(Model):
         self.doctors: list[DoctorAgent] = []
         self.agent_index: dict[str, BaseHospitalAgent] = {}
 
+        self.run_output_dir = run_output_dir
+        self.stream_logs = stream_logs
+
         self.visit_events: list[dict] = []
         self.infection_events: list[dict] = []
+        self.flow_log: list[dict] = []
+        self.state_snapshot_log: list[dict] = []
         self.seed_events: list[dict] = []
         self._scheduled_seed_introductions: list[dict] = []
+        self.total_infection_events_counter: int = 0
 
-        
+        self._visit_csv_file = None
+        self._visit_csv_writer = None
+        self._infection_csv_file = None
+        self._infection_csv_writer = None
+        self._flow_csv_file = None
+        self._flow_csv_writer = None
+        self._snapshot_csv_file = None
+        self._snapshot_csv_writer = None
+
+        self._aggregated_contact_stats: dict[tuple[str, str], dict] = {}
+
         self.current_tick = 0
         self.current_time_min = 0
 
         self._feeding_block_assignments: dict[int, dict[str, list[str]]] = {}
-         
 
         self._recent_contacts: dict[tuple[str, str], int] = {}
         self._random_nurse_station_ticks = self._sample_random_nurse_station_ticks()
@@ -725,10 +754,14 @@ class HospitalContactModel(Model):
         self.total_discharges = 0
         self.daily_flow_log: list[dict] = []
         self.daily_census_history: list[int] = []
-        self.flow_log: list[dict] = []
-        self.state_snapshot_log: list[dict] = []
+        self._daily_admissions_counter: dict[int, int] = {}
+        self._daily_discharges_counter: dict[int, int] = {}
         self._scheduled_discharges_by_hour: dict[tuple[int, int], list[str]] = {}
         self._scheduled_admissions_by_hour: dict[tuple[int, int], list[str]] = {}
+
+        if self.stream_logs and self.run_output_dir is not None:
+            os.makedirs(self.run_output_dir, exist_ok=True)
+            self._init_stream_writers()
 
         self._init_agents()
         self._assign_patients_to_rooms_deterministic()
@@ -739,6 +772,129 @@ class HospitalContactModel(Model):
         self._schedule_initial_seed_introductions()
 
         self.daily_census_history.append(self.get_current_patient_count())
+
+    def _init_stream_writers(self):
+        visit_path = os.path.join(self.run_output_dir, "visit_log.csv")
+        infection_path = os.path.join(self.run_output_dir, "infection_log.csv")
+        flow_path = os.path.join(self.run_output_dir, "flow_log.csv")
+        snapshot_path = os.path.join(self.run_output_dir, "state_snapshot.csv")
+
+        self._visit_csv_file = open(visit_path, "w", newline="", encoding="utf-8")
+        self._visit_csv_writer = csv.DictWriter(
+            self._visit_csv_file,
+            fieldnames=[
+                "run_id", "tick", "day", "time_min", "time_str",
+                "actor_id", "actor_type", "target_id", "target_type",
+                "room_id", "event_type", "duration_min",
+            ],
+        )
+        self._visit_csv_writer.writeheader()
+
+        self._infection_csv_file = open(infection_path, "w", newline="", encoding="utf-8")
+        self._infection_csv_writer = csv.DictWriter(
+            self._infection_csv_file,
+            fieldnames=[
+                "run_id", "tick", "day", "time_min", "time_str",
+                "patient_id", "source_id", "source_type",
+                "event_type", "new_state",
+            ],
+        )
+        self._infection_csv_writer.writeheader()
+
+        self._flow_csv_file = open(flow_path, "w", newline="", encoding="utf-8")
+        self._flow_csv_writer = csv.DictWriter(
+            self._flow_csv_file,
+            fieldnames=[
+                "run_id", "tick", "day", "hour", "global_hour",
+                "event", "patient_id", "room_id", "census", "occupancy",
+            ],
+        )
+        self._flow_csv_writer.writeheader()
+
+        self._snapshot_csv_file = open(snapshot_path, "w", newline="", encoding="utf-8")
+        self._snapshot_csv_writer = csv.DictWriter(
+            self._snapshot_csv_file,
+            fieldnames=[
+                "run_id", "tick", "day", "hour", "global_hour",
+                "S", "E_lat", "E_inf", "I_asym", "I_sym", "R", "D",
+                "active_cases", "census", "occupancy",
+            ],
+        )
+        self._snapshot_csv_writer.writeheader()
+
+    def _write_visit_event(self, event: dict):
+        if self.stream_logs and self._visit_csv_writer is not None:
+            self._visit_csv_writer.writerow(event)
+            self._visit_csv_file.flush()
+
+    def _write_infection_event(self, event: dict):
+        if event.get("new_state") in {"E_lat", "E_inf", "I_asym"}:
+            self.total_infection_events_counter += 1
+
+        if self.stream_logs and self._infection_csv_writer is not None:
+            self._infection_csv_writer.writerow(event)
+            self._infection_csv_file.flush()
+        else:
+            self.infection_events.append(event)
+    
+    def _write_flow_event(self, event: dict):
+        if self.stream_logs and self._flow_csv_writer is not None:
+            self._flow_csv_writer.writerow(event)
+            self._flow_csv_file.flush()
+        else:
+            self.flow_log.append(event)
+    
+    def _write_snapshot_event(self, event: dict):
+        if self.stream_logs and self._snapshot_csv_writer is not None:
+            self._snapshot_csv_writer.writerow(event)
+            self._snapshot_csv_file.flush()
+        else:
+            self.state_snapshot_log.append(event)
+    
+    def _close_stream_writers(self):
+        for handle_name in [
+            "_visit_csv_file",
+            "_infection_csv_file",
+            "_flow_csv_file",
+            "_snapshot_csv_file",
+        ]:
+            handle = getattr(self, handle_name, None)
+            if handle is not None:
+                handle.close()
+                setattr(self, handle_name, None)
+    
+    def _update_aggregated_contact_stats(self, event: dict):
+        actor_id = event["actor_id"]
+        target_id = event["target_id"]
+        actor_type = event["actor_type"]
+        target_type = event["target_type"]
+        time_min = event["time_min"]
+
+        if actor_id <= target_id:
+            u_id, u_type, v_id, v_type = actor_id, actor_type, target_id, target_type
+        else:
+            u_id, u_type, v_id, v_type = target_id, target_type, actor_id, actor_type
+
+        key = (u_id, v_id)
+
+        if key not in self._aggregated_contact_stats:
+            self._aggregated_contact_stats[key] = {
+                "run_id": self.config.run_id,
+                "u_id": u_id,
+                "u_type": u_type,
+                "v_id": v_id,
+                "v_type": v_type,
+                "total_contact_count": 0,
+                "first_time_min": time_min,
+                "last_time_min": time_min,
+            }
+
+        row = self._aggregated_contact_stats[key]
+        row["total_contact_count"] += 1
+        row["first_time_min"] = min(row["first_time_min"], time_min)
+        row["last_time_min"] = max(row["last_time_min"], time_min)
+
+    
 
     def _build_room_capacity_map(self) -> dict[str, int]:
         assert len(ROOM_CAPACITY_SPEC) == self.config.n_rooms
@@ -907,14 +1063,8 @@ class HospitalContactModel(Model):
         if completed_day < 0:
             return
 
-        admissions_completed_day = sum(
-            1 for e in self.flow_log
-            if e["day"] == completed_day and e["event"] == "admission"
-        )
-        discharges_completed_day = sum(
-            1 for e in self.flow_log
-            if e["day"] == completed_day and e["event"] == "discharge"
-        )
+        admissions_completed_day = self._daily_admissions_counter.get(completed_day, 0)
+        discharges_completed_day = self._daily_discharges_counter.get(completed_day, 0)
 
         census_end_of_day = self.get_current_patient_count()
         occupancy_end_of_day = census_end_of_day / self.config.ward_capacity
@@ -970,20 +1120,22 @@ class HospitalContactModel(Model):
         patient.remaining_los_days = None
         self.total_discharges += 1
 
-        self.flow_log.append(
-            {
-                "run_id": self.config.run_id,
-                "tick": self.current_tick,
-                "day": self.get_current_day(),
-                "hour": self.get_current_hour(),
-                "global_hour": self.get_global_hour(),
-                "event": "discharge",
-                "patient_id": patient.unique_id,
-                "room_id": previous_room_id,
-                "census": self.get_current_patient_count(),
-                "occupancy": self.get_current_patient_count() / self.config.ward_capacity,
-            }
-        )
+        day = self.get_current_day()
+
+        event = {
+            "run_id": self.config.run_id,
+            "tick": self.current_tick,
+            "day": day,
+            "hour": self.get_current_hour(),
+            "global_hour": self.get_global_hour(),
+            "event": "discharge",
+            "patient_id": patient.unique_id,
+            "room_id": previous_room_id,
+            "census": self.get_current_patient_count(),
+            "occupancy": self.get_current_patient_count() / self.config.ward_capacity,
+        }
+        self._daily_discharges_counter[day] = self._daily_discharges_counter.get(day, 0) + 1
+        self._write_flow_event(event)
 
     def _admit_patient(self, patient: PatientAgent, room_id: str):
         patient.is_active = True
@@ -997,20 +1149,22 @@ class HospitalContactModel(Model):
         self.room_occupants[room_id].append(patient.unique_id)
         self.total_admissions += 1
 
-        self.flow_log.append(
-            {
-                "run_id": self.config.run_id,
-                "tick": self.current_tick,
-                "day": self.get_current_day(),
-                "hour": self.get_current_hour(),
-                "global_hour": self.get_global_hour(),
-                "event": "admission",
-                "patient_id": patient.unique_id,
-                "room_id": room_id,
-                "census": self.get_current_patient_count(),
-                "occupancy": self.get_current_patient_count() / self.config.ward_capacity,
-            }
-        )
+        day = self.get_current_day()
+
+        event = {
+            "run_id": self.config.run_id,
+            "tick": self.current_tick,
+            "day": day,
+            "hour": self.get_current_hour(),
+            "global_hour": self.get_global_hour(),
+            "event": "admission",
+            "patient_id": patient.unique_id,
+            "room_id": room_id,
+            "census": self.get_current_patient_count(),
+            "occupancy": self.get_current_patient_count() / self.config.ward_capacity,
+        }
+        self._daily_admissions_counter[day] = self._daily_admissions_counter.get(day, 0) + 1
+        self._write_flow_event(event)
 
     def _refresh_assignments_after_census_change(self):
         for nurse in self.nurses:
@@ -1138,11 +1292,16 @@ class HospitalContactModel(Model):
             "event_type": event_type,
             "duration_min": duration_min,
         }
-        self.visit_events.append(event)
+        if not self.stream_logs:
+            self.visit_events.append(event)
+        else:
+            self._write_visit_event(event)
+
+        self._update_aggregated_contact_stats(event)
 
         contact_pair = tuple(sorted([actor_id, target_id]))
         self._recent_contacts[contact_pair] = tick
-        
+
         self._attempt_transmission_from_contact(event)
 
     def is_tick_in_block(self, tick: int, block: tuple[int, int]) -> bool:
@@ -1238,15 +1397,15 @@ class HospitalContactModel(Model):
             "run_id": self.config.run_id,
             "tick": self.current_tick,
             "day": self.get_current_day(),
-            "time_min": tick_to_time_min(self.current_tick, self.config.dt_min),
-            "time_str": minutes_to_hhmm(tick_to_time_min(self.current_tick, self.config.dt_min)),
+            "time_min": self.current_time_min,
+            "time_str": minute_to_clock_string(self.current_time_min),
             "patient_id": patient.unique_id,
             "source_id": "seed",
-            "source_type": "seed",
-            "event_type": "seed_introduction",
+            "source_type": "external",
+            "event_type": "forced_seed",
             "new_state": "I_asym",
         }
-        self.infection_events.append(event)
+        self._write_infection_event(event)
         self.seed_events.append(event)
 
     def _is_staff_agent(self, agent: BaseHospitalAgent) -> bool:
@@ -1325,20 +1484,19 @@ class HospitalContactModel(Model):
         patient.recovery_tick = None
         patient.death_tick = None
 
-        self.infection_events.append(
-            {
-                "run_id": self.config.run_id,
-                "tick": self.current_tick,
-                "day": self.get_current_day(),
-                "time_min": tick_to_time_min(self.current_tick, self.config.dt_min),
-                "time_str": minutes_to_hhmm(tick_to_time_min(self.current_tick, self.config.dt_min)),
-                "patient_id": patient.unique_id,
-                "source_id": source_id,
-                "source_type": source_type,
-                "event_type": event_type,
-                "new_state": "E_lat",
-            }
-        )
+        event = {
+            "run_id": self.config.run_id,
+            "tick": self.current_tick,
+            "day": self.get_current_day(),
+            "time_min": self.current_time_min,
+            "time_str": minute_to_clock_string(self.current_time_min),
+            "patient_id": patient.unique_id,
+            "source_id": source_id,
+            "source_type": source_type,
+            "event_type": "new_exposure",
+            "new_state": "E_lat",
+        }
+        self._write_infection_event(event)
 
     def _update_patient_infection_state(self, patient: PatientAgent):
         tick = self.current_tick
@@ -1383,20 +1541,19 @@ class HospitalContactModel(Model):
             self.config.dt_min,
         )
 
-        self.infection_events.append(
-            {
-                "run_id": self.config.run_id,
-                "tick": self.current_tick,
-                "day": self.get_current_day(),
-                "time_min": tick_to_time_min(self.current_tick, self.config.dt_min),
-                "time_str": minutes_to_hhmm(tick_to_time_min(self.current_tick, self.config.dt_min)),
-                "patient_id": patient.unique_id,
-                "source_id": patient.infected_by,
-                "source_type": "progression",
-                "event_type": "state_transition",
-                "new_state": "E_inf",
-            }
-        )
+        event = {
+            "run_id": self.config.run_id,
+            "tick": self.current_tick,
+            "day": self.get_current_day(),
+            "time_min": self.current_time_min,
+            "time_str": minute_to_clock_string(self.current_time_min),
+            "patient_id": patient.unique_id,
+            "source_id": patient.unique_id,
+            "source_type": "self_progression",
+            "event_type": "progression",
+            "new_state": "E_inf",
+        }
+        self._write_infection_event(event)
 
     def _progress_e_inf_to_i_state(self, patient: PatientAgent):
         if not patient.is_active or patient.epi_state != "E_inf":
@@ -1452,20 +1609,19 @@ class HospitalContactModel(Model):
             patient.death_tick = None
             new_state = "I_asym"
 
-        self.infection_events.append(
-            {
-                "run_id": self.config.run_id,
-                "tick": self.current_tick,
-                "day": self.get_current_day(),
-                "time_min": tick_to_time_min(self.current_tick, self.config.dt_min),
-                "time_str": minutes_to_hhmm(tick_to_time_min(self.current_tick, self.config.dt_min)),
-                "patient_id": patient.unique_id,
-                "source_id": patient.infected_by,
-                "source_type": "progression",
-                "event_type": "state_transition",
-                "new_state": new_state,
-            }
-        )
+        event = {
+            "run_id": self.config.run_id,
+            "tick": self.current_tick,
+            "day": self.get_current_day(),
+            "time_min": self.current_time_min,
+            "time_str": minute_to_clock_string(self.current_time_min),
+            "patient_id": patient.unique_id,
+            "source_id": patient.unique_id,
+            "source_type": "self_progression",
+            "event_type": "progression",
+            "new_state": patient.epi_state,
+        }
+        self._write_infection_event(event)
 
     def _process_patient_recovery(self, patient: PatientAgent):
         if not patient.is_active:
@@ -1481,20 +1637,20 @@ class HospitalContactModel(Model):
         patient.recovery_tick = None
         patient.death_tick = None
 
-        self.infection_events.append(
-            {
-                "run_id": self.config.run_id,
-                "tick": self.current_tick,
-                "day": self.get_current_day(),
-                "time_min": tick_to_time_min(self.current_tick, self.config.dt_min),
-                "time_str": minutes_to_hhmm(tick_to_time_min(self.current_tick, self.config.dt_min)),
-                "patient_id": patient.unique_id,
-                "source_id": patient.infected_by,
-                "source_type": "progression",
-                "event_type": "state_transition",
-                "new_state": "R",
-            }
-        )
+        event = {
+            "run_id": self.config.run_id,
+            "tick": self.current_tick,
+            "day": self.get_current_day(),
+            "time_min": self.current_time_min,
+            "time_str": minute_to_clock_string(self.current_time_min),
+            "patient_id": patient.unique_id,
+            "source_id": patient.unique_id,
+            "source_type": "self_progression",
+            "event_type": "recovery",
+            "new_state": "R",
+        }
+        self._write_infection_event(event)
+
 
     def _process_patient_death(self, patient: PatientAgent):
         if not patient.is_active:
@@ -1506,20 +1662,19 @@ class HospitalContactModel(Model):
         patient.is_detected = False
         patient.is_isolated = False
 
-        self.infection_events.append(
-            {
-                "run_id": self.config.run_id,
-                "tick": self.current_tick,
-                "day": self.get_current_day(),
-                "time_min": tick_to_time_min(self.current_tick, self.config.dt_min),
-                "time_str": minutes_to_hhmm(tick_to_time_min(self.current_tick, self.config.dt_min)),
-                "patient_id": patient.unique_id,
-                "source_id": patient.infected_by,
-                "source_type": "progression",
-                "event_type": "state_transition",
-                "new_state": "D",
-            }
-        )
+        event = {
+            "run_id": self.config.run_id,
+            "tick": self.current_tick,
+            "day": self.get_current_day(),
+            "time_min": self.current_time_min,
+            "time_str": minute_to_clock_string(self.current_time_min),
+            "patient_id": patient.unique_id,
+            "source_id": patient.unique_id,
+            "source_type": "self_progression",
+            "event_type": "death",
+            "new_state": "D",
+        }
+        self._write_infection_event(event)
 
         self._discharge_patient(patient)
 
@@ -1690,25 +1845,24 @@ class HospitalContactModel(Model):
                 if p.is_active and p.epi_state in {"E_inf", "I_asym", "I_sym"}
             )
 
-            self.state_snapshot_log.append(
-                {
-                    "run_id": self.config.run_id,
-                    "tick": tick + 1,
-                    "day": self.get_current_day(),
-                    "hour": (((tick + 1) % self.config.ticks_per_day) // ticks_per_hour) % 24,
-                    "global_hour": (tick + 1) // ticks_per_hour,
-                    "S": int(sum(1 for p in self.patients if p.is_active and p.epi_state == "S")),
-                    "E_lat": int(sum(1 for p in self.patients if p.is_active and p.epi_state == "E_lat")),
-                    "E_inf": int(sum(1 for p in self.patients if p.is_active and p.epi_state == "E_inf")),
-                    "I_asym": int(sum(1 for p in self.patients if p.is_active and p.epi_state == "I_asym")),
-                    "I_sym": int(sum(1 for p in self.patients if p.is_active and p.epi_state == "I_sym")),
-                    "R": int(sum(1 for p in self.patients if p.is_active and p.epi_state == "R")),
-                    "D": int(sum(1 for p in self.patients if p.epi_state == "D")),
-                    "active_cases": int(active_cases),
-                    "census": int(self.get_current_patient_count()),
-                    "occupancy": float(self.get_current_patient_count() / self.config.ward_capacity),
-                }
-            )
+            snapshot_event = {
+                "run_id": self.config.run_id,
+                "tick": tick + 1,
+                "day": self.get_current_day(),
+                "hour": (((tick + 1) % self.config.ticks_per_day) // ticks_per_hour) % 24,
+                "global_hour": (tick + 1) // ticks_per_hour,
+                "S": int(sum(1 for p in self.patients if p.is_active and p.epi_state == "S")),
+                "E_lat": int(sum(1 for p in self.patients if p.is_active and p.epi_state == "E_lat")),
+                "E_inf": int(sum(1 for p in self.patients if p.is_active and p.epi_state == "E_inf")),
+                "I_asym": int(sum(1 for p in self.patients if p.is_active and p.epi_state == "I_asym")),
+                "I_sym": int(sum(1 for p in self.patients if p.is_active and p.epi_state == "I_sym")),
+                "R": int(sum(1 for p in self.patients if p.is_active and p.epi_state == "R")),
+                "D": int(sum(1 for p in self.patients if p.epi_state == "D")),
+                "active_cases": int(active_cases),
+                "census": int(self.get_current_patient_count()),
+                "occupancy": float(self.get_current_patient_count() / self.config.ward_capacity),
+            }
+            self._write_snapshot_event(snapshot_event)
 
         self.current_tick += 1
 
@@ -1717,18 +1871,23 @@ class HospitalContactModel(Model):
 # 6) SIMULATION EXECUTION
 # =========================================================
 
-def run_simulation(config: SimConfig) -> tuple[HospitalContactModel, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-    model = HospitalContactModel(config)
-
+def run_simulation(
+    config: SimConfig,
+    run_output_dir: str,
+    stream_logs: bool = False,
+) -> tuple[HospitalContactModel, pd.DataFrame, pd.DataFrame]:
+    model = HospitalContactModel(config, run_output_dir=run_output_dir, stream_logs=stream_logs)
+    
     total_ticks = config.ticks_per_day * config.simulation_days
     for _ in range(total_ticks):
         model.step()
 
     model._finalize_previous_day_logs(config.simulation_days - 1)
 
-    visit_df = pd.DataFrame(model.visit_events)
 
-    if visit_df.empty:
+    if model._aggregated_contact_stats:
+        agg_df = pd.DataFrame(list(model._aggregated_contact_stats.values()))
+    else:
         agg_df = pd.DataFrame(
             columns=[
                 "run_id",
@@ -1741,11 +1900,42 @@ def run_simulation(config: SimConfig) -> tuple[HospitalContactModel, pd.DataFram
                 "last_time_min",
             ]
         )
-    else:
-        agg_df = build_aggregated_edges(visit_df)
 
-    summary_df = build_run_summary(config, model, visit_df, agg_df)
-    return model, visit_df, agg_df, summary_df
+    if not agg_df.empty:
+        degree_counter = Counter()
+        type_counts = Counter()
+
+        for _, row in agg_df.iterrows():
+            degree_counter[row["u_id"]] += 1
+            degree_counter[row["v_id"]] += 1
+
+            pair = "".join(sorted([row["u_type"][0].upper(), row["v_type"][0].upper()]))
+            type_counts[pair] += int(row["total_contact_count"])
+
+        top5_degree = [
+            {"node_id": node_id, "degree": degree}
+            for node_id, degree in degree_counter.most_common(5)
+        ]
+    else:
+        type_counts = Counter({"PP": 0, "NP": 0, "DP": 0, "NN": 0, "DN": 0, "DD": 0})
+        top5_degree = []
+
+    total_events = int(sum(v["total_contact_count"] for v in model._aggregated_contact_stats.values()))
+    unique_edges = int(len(model._aggregated_contact_stats))
+    total_infection_events = int(model.total_infection_events_counter)
+
+    summary_df = build_run_summary(
+        config=config,
+        model=model,
+        total_events=total_events,
+        unique_edges=unique_edges,
+        type_counts=type_counts,
+        top5_degree=top5_degree,
+        total_infection_events=total_infection_events,
+    )
+
+    model._close_stream_writers()
+    return model, agg_df, summary_df
 
 
 def run_single_simulation(
@@ -1753,8 +1943,32 @@ def run_single_simulation(
     run_output_dir: str,
     save_visit_log: bool = True,
     generate_figures: bool = True,
+    stream_logs: bool = False,
 ) -> dict[str, object]:
-    model, visit_df, agg_df, summary_df = run_simulation(config)
+    model, agg_df, summary_df = run_simulation(
+        config=config,
+        run_output_dir=run_output_dir,
+        stream_logs=stream_logs,
+    )
+    if stream_logs:
+        visit_df = pd.DataFrame(
+            columns=[
+                "run_id",
+                "tick",
+                "day",
+                "time_min",
+                "time_str",
+                "actor_id",
+                "actor_type",
+                "target_id",
+                "target_type",
+                "room_id",
+                "event_type",
+                "duration_min",
+            ]
+        )
+    else:
+        visit_df = pd.DataFrame(model.visit_events)
 
     csv_paths = export_csvs(
         config=config,
@@ -1764,34 +1978,39 @@ def run_single_simulation(
         run_output_dir=run_output_dir,
         include_visit_log=save_visit_log,
     )
-    infection_path = export_infection_csv(model, run_output_dir)
-    flow_path = export_flow_csv(model, run_output_dir)
-    state_snapshot_path = export_state_snapshot_csv(model, run_output_dir)
+    infection_path = os.path.join(run_output_dir, "infection_log.csv")
+    flow_path = os.path.join(run_output_dir, "flow_log.csv")
+    snapshot_path = os.path.join(run_output_dir, "state_snapshot.csv")
+
+    if not stream_logs:
+        infection_path = export_infection_csv(model, run_output_dir)
+        flow_path = export_flow_csv(model, run_output_dir)
+        snapshot_path = export_state_snapshot_csv(model, run_output_dir)
+
     metadata_path = export_run_metadata(config, run_output_dir)
 
-    analysis_paths = export_analysis_outputs(
-        config=config,
-        model=model,
-        visit_df=visit_df,
-        agg_df=agg_df,
-        summary_df=summary_df,
-        run_output_dir=run_output_dir,
-        generate_figures=generate_figures,
-    )
+    analysis_paths = {}
+    if generate_figures:
+        analysis_paths = export_analysis_outputs(
+            config=config,
+            model=model,
+            agg_df=agg_df,
+            run_output_dir=run_output_dir,
+            generate_figures=generate_figures,
+        )
 
     figure_paths: dict[str, str] = {}
     if generate_figures:
-        figure_paths = export_figures(config, visit_df, agg_df, run_output_dir)
+        figure_paths = export_figures(config, agg_df, run_output_dir)
 
     return {
-        "model": model,
-        "visit_df": visit_df,
-        "agg_df": agg_df,
         "summary_df": summary_df,
+        "agg_df": agg_df,
+        "stream_logs": stream_logs,
         "csv_paths": csv_paths,
         "infection_path": infection_path,
         "flow_path": flow_path,
-        "state_snapshot_path": state_snapshot_path,
+        "state_snapshot_path": snapshot_path,
         "metadata_path": metadata_path,
         "analysis_paths": analysis_paths,
         "figure_paths": figure_paths,
@@ -1802,41 +2021,6 @@ def run_single_simulation(
 # =========================================================
 # 7) DATA AGGREGATION & SUMMARY
 # =========================================================
-def build_aggregated_edges(visit_df: pd.DataFrame) -> pd.DataFrame:
-    rows = []
-    for _, r in visit_df.iterrows():
-        a_id, a_type = r["actor_id"], r["actor_type"]
-        b_id, b_type = r["target_id"], r["target_type"]
-
-        if a_id <= b_id:
-            u_id, u_type, v_id, v_type = a_id, a_type, b_id, b_type
-        else:
-            u_id, u_type, v_id, v_type = b_id, b_type, a_id, a_type
-
-        rows.append(
-            {
-                "run_id": r["run_id"],
-                "u_id": u_id,
-                "u_type": u_type,
-                "v_id": v_id,
-                "v_type": v_type,
-                "time_min": int(r["time_min"]),
-            }
-        )
-
-    tmp = pd.DataFrame(rows)
-    agg = (
-        tmp.groupby(["run_id", "u_id", "u_type", "v_id", "v_type"], as_index=False)
-        .agg(
-            total_contact_count=("time_min", "count"),
-            first_time_min=("time_min", "min"),
-            last_time_min=("time_min", "max"),
-        )
-        .sort_values(["total_contact_count", "u_id", "v_id"], ascending=[False, True, True])
-        .reset_index(drop=True)
-    )
-    return agg
-
 
 def edge_type(actor_type: str, target_type: str) -> str:
     pair = sorted([actor_type[0].upper(), target_type[0].upper()])
@@ -1846,31 +2030,13 @@ def edge_type(actor_type: str, target_type: str) -> str:
 def build_run_summary(
     config: SimConfig,
     model: HospitalContactModel,
-    visit_df: pd.DataFrame,
-    agg_df: pd.DataFrame,
+    total_events: int,
+    unique_edges: int,
+    type_counts: dict[str, int],
+    top5_degree: list[dict],
+    total_infection_events: int,
 ) -> pd.DataFrame:
-    total_events = int(len(visit_df))
-    unique_edges = int(len(agg_df))
-
-    type_counts = Counter({"PP": 0, "NP": 0, "DP": 0, "NN": 0, "DN": 0, "DD": 0})
-
-    if not visit_df.empty:
-        for _, r in visit_df.iterrows():
-            e = edge_type(r["actor_type"], r["target_type"])
-            type_counts[e] += 1
-
-    G = nx.Graph()
-    if not agg_df.empty:
-        for _, r in agg_df.iterrows():
-            G.add_node(r["u_id"], role=r["u_type"])
-            G.add_node(r["v_id"], role=r["v_type"])
-            G.add_edge(r["u_id"], r["v_id"], weight=int(r["total_contact_count"]))
-
-    degree = dict(G.degree())
-    wdegree = dict(G.degree(weight="weight"))
-
-    top5_degree = sorted(degree.items(), key=lambda x: x[1], reverse=True)[:5]
-    top5_wdegree = sorted(wdegree.items(), key=lambda x: x[1], reverse=True)[:5]
+    top5_degree_json = json.dumps(top5_degree, ensure_ascii=False)
 
     census_history = model.daily_census_history if model.daily_census_history else [model.get_current_patient_count()]
     occupancy_history = [c / config.n_patients for c in census_history]
@@ -1895,15 +2061,15 @@ def build_run_summary(
                 "occupancy_mean_over_run": float(sum(occupancy_history) / len(occupancy_history)),
                 "occupancy_min_over_run": float(min(occupancy_history)),
                 "occupancy_max_over_run": float(max(occupancy_history)),
-                "total_events": total_events,
-                "unique_edges": unique_edges,
-                "total_PP_events": int(type_counts["PP"]),
-                "total_PN_events": int(type_counts["NP"]),
-                "total_PD_events": int(type_counts["DP"]),
-                "total_NN_events": int(type_counts["NN"]),
-                "total_ND_events": int(type_counts["DN"]),
-                "total_DD_events": int(type_counts["DD"]),
-                "top5_nodes_by_degree": json.dumps(top5_degree),
+                "total_events": int(total_events),
+                "unique_edges": int(unique_edges),
+                "total_PP_events": int(type_counts.get("PP", 0)),
+                "total_PN_events": int(type_counts.get("NP", 0)),
+                "total_PD_events": int(type_counts.get("DP", 0)),
+                "total_NN_events": int(type_counts.get("NN", 0)),
+                "total_ND_events": int(type_counts.get("DN", 0)),
+                "total_DD_events": int(type_counts.get("DD", 0)),
+                "top5_nodes_by_degree": top5_degree_json,
                 "final_S": int(sum(1 for p in model.patients if p.epi_state == "S")),
                 "final_E_lat": int(sum(1 for p in model.patients if p.epi_state == "E_lat")),
                 "final_E_inf": int(sum(1 for p in model.patients if p.epi_state == "E_inf")),
@@ -1911,7 +2077,7 @@ def build_run_summary(
                 "final_I_sym": int(sum(1 for p in model.patients if p.epi_state == "I_sym")),
                 "final_R": int(sum(1 for p in model.patients if p.epi_state == "R")),
                 "final_D": int(sum(1 for p in model.patients if p.epi_state == "D")),
-                "total_infection_events": int(len([e for e in model.infection_events if e["new_state"] in {"E_lat", "E_inf"}])),
+                "total_infection_events": int(total_infection_events),
             }
         ]
     )
@@ -1939,7 +2105,8 @@ def export_csvs(
     summary_path = os.path.join(run_output_dir, "run_summary.csv")
 
     if include_visit_log:
-        visit_df.to_csv(visit_path, index=False)
+        if not os.path.exists(visit_path):
+            visit_df.to_csv(visit_path, index=False)
     else:
         visit_path = None
     agg_df.to_csv(agg_path, index=False)
@@ -2057,7 +2224,9 @@ def plot_network(config: SimConfig, agg_df: pd.DataFrame, out_path: str):
     plt.close()
 
 
-def plot_timeseries(config: SimConfig, visit_df: pd.DataFrame, out_path: str):
+def plot_timeseries(config: SimConfig, visit_log_path: str, out_path: str):
+    visit_df = load_visit_log_df(visit_log_path)
+
     total_ticks = config.ticks_per_day * config.simulation_days
     ticks = list(range(total_ticks))
     total_counts = [0] * total_ticks
@@ -2074,7 +2243,6 @@ def plot_timeseries(config: SimConfig, visit_df: pd.DataFrame, out_path: str):
                     pn_counts[tick] += 1
                 elif tpair == "DP":
                     pd_counts[tick] += 1
-
     x_days = [t * config.dt_min / MINUTES_PER_DAY for t in ticks]
 
     plt.figure(figsize=(14, 5))
@@ -2129,7 +2297,7 @@ def plot_degree_hist(config: SimConfig, agg_df: pd.DataFrame, out_path: str):
     plt.close()
 
 
-def export_figures(config: SimConfig, visit_df: pd.DataFrame, agg_df: pd.DataFrame, run_output_dir: str | None = None):
+def export_figures(config: SimConfig, agg_df: pd.DataFrame, run_output_dir: str | None = None):
     if run_output_dir is None:
         run_output_dir = config.output_dir
 
@@ -2141,7 +2309,8 @@ def export_figures(config: SimConfig, visit_df: pd.DataFrame, agg_df: pd.DataFra
     degree_hist_path = os.path.join(fig_dir, "degree_hist.png")
 
     plot_network(config, agg_df, network_path)
-    plot_timeseries(config, visit_df, timeseries_path)
+    visit_log_path = os.path.join(run_output_dir, "visit_log.csv")
+    plot_timeseries(config, visit_log_path, timeseries_path)
     plot_degree_hist(config, agg_df, degree_hist_path)
 
     return {
@@ -2153,6 +2322,47 @@ def export_figures(config: SimConfig, visit_df: pd.DataFrame, agg_df: pd.DataFra
 # =========================================================
 # 9/B) OUTPUT ANALYSIS
 # =========================================================
+def load_visit_log_df(visit_log_path: str) -> pd.DataFrame:
+    if not os.path.exists(visit_log_path):
+        return pd.DataFrame(
+            columns=[
+                "run_id",
+                "tick",
+                "day",
+                "time_min",
+                "time_str",
+                "actor_id",
+                "actor_type",
+                "target_id",
+                "target_type",
+                "room_id",
+                "event_type",
+                "duration_min",
+            ]
+        )
+
+    try:
+        df = pd.read_csv(visit_log_path)
+    except pd.errors.EmptyDataError:
+        return pd.DataFrame(
+            columns=[
+                "run_id",
+                "tick",
+                "day",
+                "time_min",
+                "time_str",
+                "actor_id",
+                "actor_type",
+                "target_id",
+                "target_type",
+                "room_id",
+                "event_type",
+                "duration_min",
+            ]
+        )
+
+    return df
+
 def _normalize_role_pair(actor_type: str, target_type: str) -> str:
     pair = tuple(sorted([actor_type, target_type]))
     mapping = {
@@ -2166,8 +2376,10 @@ def _normalize_role_pair(actor_type: str, target_type: str) -> str:
     return mapping[pair]
 
 
-def build_daily_timeseries_dataset(config: SimConfig, visit_df: pd.DataFrame) -> pd.DataFrame:
-    if visit_df.empty:
+def build_daily_timeseries_dataset(config: SimConfig, visit_log_path: str) -> pd.DataFrame:
+    df = load_visit_log_df(visit_log_path)
+
+    if df.empty:
         return pd.DataFrame(
             columns=[
                 "day",
@@ -2183,8 +2395,6 @@ def build_daily_timeseries_dataset(config: SimConfig, visit_df: pd.DataFrame) ->
                 "unique_all_agents",
             ]
         )
-
-    df = visit_df.copy()
 
     if "day" not in df.columns:
         df["day"] = (df["tick"] // config.ticks_per_day).astype(int)
@@ -2272,8 +2482,10 @@ def build_daily_timeseries_dataset(config: SimConfig, visit_df: pd.DataFrame) ->
     return ts_df
 
 
-def build_role_pair_tables(visit_df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-    if visit_df.empty:
+def build_role_pair_tables(visit_log_path: str) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    df = load_visit_log_df(visit_log_path)
+
+    if df.empty:
         summary = pd.DataFrame(columns=["role_pair", "count", "ratio"])
         matrix_counts = pd.DataFrame(
             0,
@@ -2282,8 +2494,7 @@ def build_role_pair_tables(visit_df: pd.DataFrame) -> tuple[pd.DataFrame, pd.Dat
         )
         matrix_ratios = matrix_counts.astype(float)
         return summary, matrix_counts, matrix_ratios
-
-    df = visit_df.copy()
+    
     df["role_pair"] = df.apply(
         lambda r: _normalize_role_pair(r["actor_type"], r["target_type"]),
         axis=1,
@@ -2526,16 +2737,16 @@ def plot_daily_flow(daily_flow_df: pd.DataFrame, out_path: str):
 def export_analysis_outputs(
     config: SimConfig,
     model: HospitalContactModel,
-    visit_df: pd.DataFrame,
     agg_df: pd.DataFrame,
-    summary_df: pd.DataFrame,
     run_output_dir: str,
     generate_figures: bool = True,
 ):
-    ts_df = build_daily_timeseries_dataset(config, visit_df)
-    role_pair_summary_df, role_pair_matrix_counts_df, role_pair_matrix_ratios_df = build_role_pair_tables(visit_df)
+    visit_log_path = os.path.join(run_output_dir, "visit_log.csv")
+
+    ts_df = build_daily_timeseries_dataset(config, visit_log_path)
+    role_pair_summary_df, role_pair_matrix_counts_df, role_pair_matrix_ratios_df = build_role_pair_tables(visit_log_path)
     degree_node_df, degree_role_df = build_degree_tables(agg_df)
-    daily_flow_df = build_daily_flow_dataframe(model)    
+    daily_flow_df = build_daily_flow_dataframe(model)   
     
     ts_path = os.path.join(run_output_dir, "timeseries_daily.csv")
     role_pair_summary_path = os.path.join(run_output_dir, "role_pair_summary.csv")
@@ -2614,13 +2825,13 @@ def resolve_base_seed(args: argparse.Namespace) -> int:
     return args.base_seed
 
 
-def export_all_runs_summary(summary_frames: list[pd.DataFrame], base_output_dir: str) -> tuple[str, pd.DataFrame]:
+def export_all_runs_summary(summary_frames: list[pd.DataFrame], batch_output_dir: str) -> tuple[str, pd.DataFrame]:
     if summary_frames:
         all_runs_summary_df = pd.concat(summary_frames, ignore_index=True)
     else:
         all_runs_summary_df = pd.DataFrame(columns=["run_id", "seed"])
 
-    output_path = os.path.join(base_output_dir, "all_runs_summary.csv")
+    output_path = os.path.join(batch_output_dir, "all_runs_summary.csv")
     all_runs_summary_df.to_csv(output_path, index=False)
     return output_path, all_runs_summary_df
 
@@ -2692,11 +2903,16 @@ def main():
             run_output_dir=run_output_dir,
             save_visit_log=True,
             generate_figures=True,
+            stream_logs=False,
         )
         print_single_run_report(result)
         return
 
     batch_summary_frames: list[pd.DataFrame] = []
+
+    batch_output_dir = ensure_unique_output_dir(
+        build_batch_output_dir(SimConfig().output_dir, base_seed, args.n_runs)
+    )
 
     for run_index in range(args.n_runs):
         run_number = run_index + 1
@@ -2704,7 +2920,7 @@ def main():
         run_id = f"run_{run_number:03d}"
         config = SimConfig(seed=seed, run_id=run_id)
         run_output_dir = ensure_unique_output_dir(
-            build_batch_run_output_dir(config.output_dir, run_number)
+            build_batch_run_output_dir(batch_output_dir, run_number)
         )
 
         print(f"Starting run {run_number}/{args.n_runs} with seed {seed}")
@@ -2713,8 +2929,9 @@ def main():
             result = run_single_simulation(
                 config=config,
                 run_output_dir=run_output_dir,
-                save_visit_log=False,
+                save_visit_log=True,
                 generate_figures=False,
+                stream_logs=True,
             )
             batch_summary_frames.append(result["summary_df"])
             print(f"Finished run {run_number}/{args.n_runs}")
@@ -2722,8 +2939,10 @@ def main():
             print(f"Run {run_number}/{args.n_runs} failed with seed {seed}: {exc}")
             continue
 
-    all_runs_summary_path, all_runs_summary_df = export_all_runs_summary(batch_summary_frames, SimConfig().output_dir)
-
+    print(f"batch_output_dir={batch_output_dir}")
+    
+    all_runs_summary_path, all_runs_summary_df = export_all_runs_summary(batch_summary_frames, batch_output_dir)
+    
     print("\n=== Batch execution finished ===")
     print(f"successful_runs={len(all_runs_summary_df)}, requested_runs={args.n_runs}")
     print(f"all_runs_summary={all_runs_summary_path}")
