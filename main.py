@@ -111,7 +111,7 @@ class SimConfig:
     mean_doctor_patient_contact_duration_min: int = 4
     contact_duration_distribution: str = "exponential"
 
-    admission_room_assignment_rule: str = "first_available_bed"
+    admission_room_assignment_rule: str = "lowest_occupancy_ratio_then_random"
     day_boundary_rule: str = "decrement_los_then_discharge_then_admit_then_refresh_assignments"
 
     feeding_coverage_min: float = 0.30
@@ -125,11 +125,14 @@ class SimConfig:
     # =========================================================
     # Infection dynamics configuration
     # =========================================================
-    #initial_seed_infections: int = 1
-    #seed_in_first_days: int = 2    # ez a két paraméter együtt határozza meg, hogy hány seed fertőzés legyen a szimuláció elején,
-                                    # és hogy azok milyen gyorsan kerüljenek be (pl. 2 seed az első 2 napban, vagy 4 seed az első napban)
-                                    # de jelenleg a hardcodeolt  seedelés miatt nincsnnek használatban
+    initial_seed_infections: int = 1
+    seed_in_first_days: int = 1
+    seed_state: str = "I_asym"          # választható: "E_lat", "E_inf", "I_asym"
+    seed_start_hour: int = 9            # első seedelési időablak kezdete
+    seed_end_hour: int = 9              # ha ugyanaz, fix óra; ha nagyobb, órablakból mintáz
+    seed_only_active_patients: bool = True
 
+    
     p_symptomatic: float = 0.60
     infection_fatality_ratio: float = 0.0104
 
@@ -1099,11 +1102,22 @@ class HospitalContactModel(Model):
             p *= self.rng.random()
         return k - 1
 
-    def _find_first_available_bed(self) -> str | None:
-        for room_id, capacity in self.room_capacity_map.items():
-            if len(self.room_occupants[room_id]) < capacity:
-                return room_id
+def _find_first_available_bed(self) -> str | None:
+    candidate_rooms = []
+
+    for room_id, capacity in self.room_capacity_map.items():
+        occupied = len(self.room_occupants[room_id])
+        if occupied < capacity:
+            occupancy_ratio = occupied / capacity
+            candidate_rooms.append((room_id, occupancy_ratio))
+
+    if not candidate_rooms:
         return None
+
+    min_ratio = min(ratio for _, ratio in candidate_rooms)
+    best_rooms = [room_id for room_id, ratio in candidate_rooms if ratio == min_ratio]
+
+    return self.rng.choice(best_rooms)
 
     def _get_inactive_patients_pool(self) -> list[PatientAgent]:
         return [p for p in self.patients if not p.is_active]
@@ -1339,59 +1353,90 @@ class HospitalContactModel(Model):
     # =========================================================
     # Infection dynamics
     # =========================================================
-    def _schedule_initial_seed_introductions(self):
-        seed_patient_id = "patient_53"
-        seed_tick = 9 * 60 // self.config.dt_min   # 09:00, nappali aktivitási időben
-
-        self._scheduled_seed_introductions = [
-            {
-                "patient_id": seed_patient_id,
-                "seed_tick": seed_tick,
-                "seed_state": "I_asym",
-            }
-        ]
-
-    def _apply_scheduled_seed_introductions(self):
-        if not self._scheduled_seed_introductions:
-            return
-
-        remaining = []
-        for item in self._scheduled_seed_introductions:
-            if item["seed_tick"] != self.current_tick:
-                remaining.append(item)
+    def _get_seed_candidate_patients(self) -> list[PatientAgent]:
+        candidates = []
+        for patient in self.patients:
+            if self.config.seed_only_active_patients and not patient.is_active:
                 continue
+            if patient.epi_state != "S":
+                continue
+            candidates.append(patient)
+        return candidates
 
-            patient = self.agent_index.get(item["patient_id"])
-            if isinstance(patient, PatientAgent) and patient.is_active and patient.epi_state == "S":
-                self._force_seed_patient_as_i_asym(patient)
-
-        self._scheduled_seed_introductions = remaining
-
-    def _force_seed_patient_as_i_asym(self, patient: PatientAgent):
-        patient.epi_state = "I_asym"
-        patient.is_infectious = True
+    def _seed_state_to_flags(self, patient: PatientAgent, seed_state: str):
         patient.is_symptomatic = False
         patient.is_detected = False
         patient.is_isolated = False
-
         patient.infected_by = "seed"
         patient.infection_tick = self.current_tick
-        patient.latent_until_tick = None
-        patient.presymptomatic_until_tick = None
-
-        recovery_days = max(
-            4.0,
-            sample_gamma_days(
-                self.rng,
-                self.config.recovery_asym_shape,
-                self.config.recovery_asym_scale_days,
-            )
-        )
-        patient.recovery_tick = self.current_tick + days_to_ticks(
-            recovery_days,
-            self.config.dt_min,
-        )
         patient.death_tick = None
+
+        if seed_state == "E_lat":
+            patient.epi_state = "E_lat"
+            patient.is_infectious = False
+
+            latent_days = sample_gamma_days(
+                self.rng,
+                self.config.latent_shape,
+                self.config.latent_scale_days,
+            )
+            patient.latent_until_tick = self.current_tick + days_to_ticks(
+                latent_days,
+                self.config.dt_min,
+            )
+            patient.presymptomatic_until_tick = None
+            patient.recovery_tick = None
+            return
+
+        if seed_state == "E_inf":
+            patient.epi_state = "E_inf"
+            patient.is_infectious = True
+
+            presymptomatic_days = sample_gamma_days(
+                self.rng,
+                self.config.presymptomatic_shape,
+                self.config.presymptomatic_scale_days,
+            )
+            patient.latent_until_tick = None
+            patient.presymptomatic_until_tick = self.current_tick + days_to_ticks(
+                presymptomatic_days,
+                self.config.dt_min,
+            )
+            patient.recovery_tick = None
+            return
+
+        if seed_state == "I_asym":
+            patient.epi_state = "I_asym"
+            patient.is_infectious = True
+
+            recovery_days = max(
+                4.0,
+                sample_gamma_days(
+                    self.rng,
+                    self.config.recovery_asym_shape,
+                    self.config.recovery_asym_scale_days,
+                )
+            )
+            patient.latent_until_tick = None
+            patient.presymptomatic_until_tick = None
+            patient.recovery_tick = self.current_tick + days_to_ticks(
+                recovery_days,
+                self.config.dt_min,
+            )
+            return
+
+        raise ValueError(
+            f"Unsupported seed_state='{seed_state}'. "
+            f"Allowed: 'E_lat', 'E_inf', 'I_asym'."
+        )
+
+    def _force_seed_patient(self, patient: PatientAgent, seed_state: str):
+        if not patient.is_active:
+            return
+        if patient.epi_state != "S":
+            return
+
+        self._seed_state_to_flags(patient, seed_state)
 
         event = {
             "run_id": self.config.run_id,
@@ -1403,10 +1448,66 @@ class HospitalContactModel(Model):
             "source_id": "seed",
             "source_type": "external",
             "event_type": "forced_seed",
-            "new_state": "I_asym",
+            "new_state": seed_state,
         }
         self._write_infection_event(event)
         self.seed_events.append(event)
+
+    def _schedule_initial_seed_introductions(self):
+        self._scheduled_seed_introductions = []
+
+        n_seeds = max(0, int(self.config.initial_seed_infections))
+        if n_seeds == 0:
+            return
+
+        n_days = max(1, int(self.config.seed_in_first_days))
+        max_days = max(1, int(self.config.simulation_days))
+        n_days = min(n_days, max_days)
+
+        start_hour = int(self.config.seed_start_hour)
+        end_hour = int(self.config.seed_end_hour)
+
+        if start_hour < 0 or start_hour > 23 or end_hour < 0 or end_hour > 23:
+            raise ValueError("seed_start_hour and seed_end_hour must be between 0 and 23")
+
+        if end_hour < start_hour:
+            raise ValueError("seed_end_hour must be >= seed_start_hour")
+
+        for _ in range(n_seeds):
+            seed_day = self.rng.randint(0, n_days - 1)
+            seed_hour = self.rng.randint(start_hour, end_hour)
+            seed_minute = seed_hour * 60
+            seed_tick = (seed_day * self.config.ticks_per_day) + (seed_minute // self.config.dt_min)
+
+            self._scheduled_seed_introductions.append(
+                {
+                    "seed_tick": seed_tick,
+                    "seed_state": self.config.seed_state,
+                }
+            )
+
+        self._scheduled_seed_introductions.sort(key=lambda x: x["seed_tick"])
+        print("SCHEDULED SEEDS:", self._scheduled_seed_introductions)
+
+    def _apply_scheduled_seed_introductions(self):
+        if not self._scheduled_seed_introductions:
+            return
+
+        remaining = []
+        for item in self._scheduled_seed_introductions:
+            if item["seed_tick"] != self.current_tick:
+                remaining.append(item)
+                continue
+
+            candidates = self._get_seed_candidate_patients()
+            if not candidates:
+                continue
+
+            patient = self.rng.choice(candidates)
+            self._force_seed_patient(patient, item["seed_state"])
+
+        self._scheduled_seed_introductions = remaining
+
 
     def _is_staff_agent(self, agent: BaseHospitalAgent) -> bool:
         return isinstance(agent, (NurseAgent, DoctorAgent))
@@ -2016,6 +2117,7 @@ def build_run_summary(
     top5_degree: list[dict],
     total_infection_events: int,
 ) -> pd.DataFrame:
+    print("SUMMARY SEED EVENTS:", len(model.seed_events))
     top5_degree_json = json.dumps(top5_degree, ensure_ascii=False)
 
     census_history = model.daily_census_history if model.daily_census_history else [model.get_current_patient_count()]
@@ -2034,6 +2136,20 @@ def build_run_summary(
                 "ticks_per_day": config.ticks_per_day,
                 "simulation_days": config.simulation_days,
                 "initial_patient_count": config.initial_patient_count,
+                "initial_seed_infections": config.initial_seed_infections,
+                "seed_in_first_days": config.seed_in_first_days,
+                "seed_state": config.seed_state,
+                "seed_start_hour": config.seed_start_hour,
+                "seed_end_hour": config.seed_end_hour,
+                "applied_seed_events": int(len(model.seed_events)),
+                "first_seed_tick": (
+                    int(min(e["tick"] for e in model.seed_events))
+                    if model.seed_events else None
+                ),
+                "last_seed_tick": (
+                    int(max(e["tick"] for e in model.seed_events))
+                    if model.seed_events else None
+                ),
                 "total_admissions": model.total_admissions,
                 "total_discharges": model.total_discharges,
                 "final_patient_count": model.get_current_patient_count(),
@@ -2140,6 +2256,12 @@ def export_run_metadata(config: SimConfig, run_output_dir: str) -> str:
         "mean_los_days": config.mean_los_days,
         "los_distribution": config.los_distribution,
         "initial_remaining_los_distribution": config.initial_remaining_los_distribution,
+        "initial_seed_infections": config.initial_seed_infections,
+        "seed_in_first_days": config.seed_in_first_days,
+        "seed_state": config.seed_state,
+        "seed_start_hour": config.seed_start_hour,
+        "seed_end_hour": config.seed_end_hour,
+        "seed_only_active_patients": config.seed_only_active_patients,
         "p_symptomatic": config.p_symptomatic,
         "infection_fatality_ratio": config.infection_fatality_ratio,
         "latent_shape": config.latent_shape,
@@ -2799,6 +2921,11 @@ def parse_args() -> argparse.Namespace:
         default="",
         help="Run identifier (default: UNIX timestamp)",
     )
+    parser.add_argument("--initial-seed-infections", type=int, default=1)
+    parser.add_argument("--seed-in-first-days", type=int, default=1)
+    parser.add_argument("--seed-state", type=str, default="I_asym", choices=["E_lat", "E_inf", "I_asym"])
+    parser.add_argument("--seed-start-hour", type=int, default=9)
+    parser.add_argument("--seed-end-hour", type=int, default=9)
     return parser.parse_args()
 
 
@@ -2876,10 +3003,26 @@ def main():
 
     if args.n_runs == 1:
         run_id = args.run_id or str(int(datetime.utcnow().timestamp()))
-        config = SimConfig(seed=base_seed, run_id=run_id)
+        config = SimConfig(
+            seed=base_seed,
+            run_id=run_id,
+            initial_seed_infections=args.initial_seed_infections,
+            seed_in_first_days=args.seed_in_first_days,
+            seed_state=args.seed_state,
+            seed_start_hour=args.seed_start_hour,
+            seed_end_hour=args.seed_end_hour,
+        )
         run_output_dir = ensure_unique_output_dir(
             build_run_output_dir(config.output_dir, config.run_id, config.seed)
         )
+        print("RUN_OUTPUT_DIR:", run_output_dir)
+        print("SEED CONFIG:", {
+            "initial_seed_infections": config.initial_seed_infections,
+            "seed_in_first_days": config.seed_in_first_days,
+            "seed_state": config.seed_state,
+            "seed_start_hour": config.seed_start_hour,
+            "seed_end_hour": config.seed_end_hour,
+        })
 
         result = run_single_simulation(
             config=config,
@@ -2900,7 +3043,15 @@ def main():
         run_number = run_index + 1
         seed = base_seed + run_index
         run_id = f"run_{run_number:03d}"
-        config = SimConfig(seed=seed, run_id=run_id)
+        config = SimConfig(
+            seed=seed,
+            run_id=run_id,
+            initial_seed_infections=args.initial_seed_infections,
+            seed_in_first_days=args.seed_in_first_days,
+            seed_state=args.seed_state,
+            seed_start_hour=args.seed_start_hour,
+            seed_end_hour=args.seed_end_hour,
+        )
         run_output_dir = ensure_unique_output_dir(
             build_batch_run_output_dir(batch_output_dir, run_number)
         )
