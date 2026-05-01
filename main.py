@@ -10,16 +10,21 @@ but agents drive most contact generation.
 MULTI-DAY EXTENSION:
 - 30-day simulation
 - dynamic admissions/discharges
-- fixed baseline staffing
+- dynamic staff pool with day/night shift assignment
 - infection dynamics included
 
-Outputs:
-- outputs/visit_log.csv
-- outputs/aggregated_edges.csv
-- outputs/run_summary.csv
-- outputs/figures/network.png
-- outputs/figures/timeseries.png
-- outputs/figures/degree_hist.png
+Outputs include:
+- visit_log.csv
+- infection_log.csv
+- flow_log.csv
+- state_snapshot.csv
+- aggregated_edges.csv
+- run_summary.csv
+- run_metadata.json
+- daily_flow.csv
+- timeseries_daily.csv
+- role-pair and degree summary files
+- optional figures
 """
 
 # =========================================================
@@ -33,7 +38,7 @@ import math
 import os
 import random
 from collections import Counter
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 
 import matplotlib.pyplot as plt
@@ -50,12 +55,24 @@ TICKS_PER_DAY = MINUTES_PER_DAY // DEFAULT_DT_MIN
 # 83-bed ward:
 # 1x1-bed, 5x2-bed, 18x4-bed = 83 beds total
 ROOM_CAPACITY_SPEC = [1, 2, 2, 2, 2, 2] + [4] * 18
+
+ROOM_CONFIGS = {
+    # 83 beds, current baseline structure: 1x1-bed, 5x2-bed, 18x4-bed
+    "baseline": [1, 2, 2, 2, 2, 2] + [4] * 18,
+
+    # 83 beds, small-room dominant structure: 21x1-bed, 31x2-bed
+    "small": [1] * 21 + [2] * 31,
+
+    # 83 beds, medium-room structure: 17x3-bed, 8x4-bed
+    "medium": [3] * 17 + [4] * 8,
+
+    # 83 beds, large-room structure: 13x5-bed, 3x6-bed
+    "large": [5] * 13 + [6] * 3,
+}
+
 N_PATIENTS = sum(ROOM_CAPACITY_SPEC)  # 83
 N_ROOMS = len(ROOM_CAPACITY_SPEC)     # 24
 
-# Fixed baseline staffing
-N_NURSES = 7
-N_DOCTORS = 4
 
 DURATION_MIN_DEFAULT = 5
 
@@ -79,18 +96,25 @@ class SimConfig:
     ticks_per_day: int = TICKS_PER_DAY
     simulation_days: int = 30
 
+    room_config_name: str = "baseline"
+    room_capacity_spec: list[int] = field(default_factory=lambda: list(ROOM_CONFIGS["baseline"]))
+
     ward_capacity: int = N_PATIENTS
     n_patients: int = N_PATIENTS
-    n_nurses: int = N_NURSES
-    n_doctors: int = N_DOCTORS
+    # teljes dolgozói állomány, nem az egy időben aktív baseline
+    n_nurses: int = 14
+    n_doctors: int = 6
     n_rooms: int = N_ROOMS
 
     target_bed_occupancy: float = 0.6829
     mean_los_days: float = 7.69
     initial_patient_count: int = 57
-    #daily_admissions_mean: float = 7.37    # ez a paraméter jelenleg nincs használatban, mert a napi felvételek is a központi LOS mintavételből származnak, így implicit módon igazodnak a kimenő betegek számához
-    los_distribution: str = "fixed"
-    initial_remaining_los_distribution: str = "discrete_uniform_1_8"
+    los_distribution: str = "gamma"
+    initial_remaining_los_distribution: str = "random_point_in_stay"
+
+    los_gamma_shape: float = 2.0
+    los_min_days: int = 1
+    los_max_days: int = 30
 
     baseline_nurses_day: int = 7
     baseline_nurses_night: int = 5
@@ -100,6 +124,10 @@ class SimConfig:
     shift_length_hours: int = 12
     nurse_shift_times: str = "07:00-19:00"
     doctor_shift_times: str = "08:00-17:00"
+    staff_rotation_mode: str = "cyclic_with_shift_pools"
+    staff_symptomatic_stay_home_probability: float = 1.0  # 1.0 minden tünetes kiesik, 0.0 senki nem esik ki, 0,4 például 40% esik ki
+    staff_off_shift_community_exposure_per_day: float = 0
+    staff_symptomatic_off_duty_days: int = 5
 
     nurse_rounds_per_day: int = 3
     doctor_visits_per_patient_per_day: int = 1
@@ -119,6 +147,7 @@ class SimConfig:
     p_ad_hoc_tick: float = 0.20
     ad_hoc_max_events_per_tick: int = 2
     nurse_station_random_ticks_per_day: int = 10
+    roommate_contact_interval_min: int = 120
 
     output_dir: str = "outputs"
 
@@ -156,11 +185,11 @@ class SimConfig:
     death_shape: float = 4.9383
     death_scale_days: float = 3.6045
 
-    # transmission placeholders, later to calibrate
-    beta_patient_patient_per_5min: float = 0.015    #szükség esetény egy gyengébb védhetőbb érték = 0.002
-    beta_hcw_to_patient_per_5min: float = 0.03      #szükség esetény egy gyengébb védhetőbb érték = 0.008
-    beta_patient_to_hcw_per_5min: float = 0.03      #szükség esetény egy gyengébb védhetőbb érték = 0.008
-                                                    #A mostani 0.015 PP mellett egy többnapos szobatársi együttfekvés nagyon gyorsan túl erős fertőzési nyomást ad
+    # transmission probabilities per 5-minute contact interval
+    beta_patient_patient_per_5min: float = 0.015    # alternative sensitivity-analysis value: 0.002
+    beta_hcw_to_patient_per_5min: float = 0.03      # alternative sensitivity-analysis value: 0.008
+    beta_patient_to_hcw_per_5min: float = 0.03      # alternative sensitivity-analysis value: 0.008
+                                                    # Higher PP beta values increase the cumulative exposure effect during long roommate stays.
 
     # relative infectiousness by stage
     e_inf_relative_infectiousness: float = 0.80
@@ -169,10 +198,34 @@ class SimConfig:
 
     isolation_transmission_multiplier: float = 0.30
 
-    # transient HCW contamination
-    hcw_contamination_duration_days: float = 0.5
-    hand_hygiene_clearance_prob_after_patient_contact: float = 0.20
+    # staff mask use
+    mask_strategy: str = "random"  # random vagy targeted_ids
+    targeted_mask_hcw_ids: str = ""
 
+    mask_compliance_hcw: float = 0.20  # alapérték; a szakirodalomban kb. 47% is szerepelhet
+    mask_source_multiplier_hcw: float = 0.30
+    mask_target_multiplier_hcw: float = 0.50
+
+    beta_hcw_hcw_per_5min: float = 0.01
+    hcw_relative_infectiousness: float = 0.80
+
+    def __post_init__(self):
+        if self.room_config_name not in ROOM_CONFIGS:
+            raise ValueError(
+                f"Unsupported room_config_name='{self.room_config_name}'. "
+                f"Allowed values: {list(ROOM_CONFIGS.keys())}"
+            )
+
+        self.room_capacity_spec = list(ROOM_CONFIGS[self.room_config_name])
+        self.ward_capacity = sum(self.room_capacity_spec)
+        self.n_patients = self.ward_capacity
+        self.n_rooms = len(self.room_capacity_spec)
+
+        if self.initial_patient_count > self.ward_capacity:
+            raise ValueError(
+                f"initial_patient_count={self.initial_patient_count} exceeds "
+                f"ward_capacity={self.ward_capacity}"
+            )
 
 # =========================================================
 # 3) TIME UTILITIES
@@ -309,10 +362,35 @@ class NurseAgent(BaseHospitalAgent):
 
         self.handover_block_idx: int = -1
         self.handover_initiated_this_block: bool = False
-        
-        self.contaminated_until_tick: int | None = None
+
+        self.is_on_shift: bool = False
+        self.shift_label: str = "off"
+        self.preferred_shift: str = "day"
+        self.rotation_offset: int = 0
+        self.days_off_until_day: int | None = None
+        self.mask_compliant: bool = False
+
+        self.epi_state: str = "S"
+        self.is_infectious: bool = False
+        self.is_symptomatic: bool = False
+        self.is_detected: bool = False
+        self.is_isolated: bool = False
+
+        self.infection_tick: int | None = None
+        self.infected_by: str | None = None
+
+        self.latent_until_tick: int | None = None
+        self.presymptomatic_until_tick: int | None = None
+        self.recovery_tick: int | None = None
+        self.death_tick: int | None = None
 
     def step(self):
+        self.model._update_staff_infection_state(self)
+
+        if not self.is_on_shift:
+            self.current_state = "off_shift"
+            return
+
         time_min = self.model.get_current_time_min()
         tick = self.model.current_tick
 
@@ -498,7 +576,10 @@ class NurseAgent(BaseHospitalAgent):
         interactant_option = self.model.rng.choice(["nurse", "doctor"])
 
         if interactant_option == "nurse":
-            other_nurses = [n for n in self.model.nurses if n.unique_id != self.unique_id]
+            other_nurses = [
+                n for n in self.model.nurses
+                if n.unique_id != self.unique_id and n.is_on_shift
+            ]
             if other_nurses:
                 other = self.model.rng.choice(other_nurses)
                 if not self.model.is_recent_contact(self.unique_id, other.unique_id, tick, window_ticks=5):
@@ -510,8 +591,9 @@ class NurseAgent(BaseHospitalAgent):
                     )
                     self.handover_initiated_this_block = True
         else:
-            if self.model.doctors:
-                doctor = self.model.rng.choice(self.model.doctors)
+            on_shift_doctors = [d for d in self.model.doctors if d.is_on_shift]
+            if on_shift_doctors:
+                doctor = self.model.rng.choice(on_shift_doctors)
                 if not self.model.is_recent_contact(self.unique_id, doctor.unique_id, tick, window_ticks=5):
                     self.model.record_contact(
                         tick=tick,
@@ -557,9 +639,34 @@ class DoctorAgent(BaseHospitalAgent):
         self.handover_block_idx: int = -1
         self.handover_initiated_this_block: bool = False
 
-        self.contaminated_until_tick: int | None = None        
+        self.is_on_shift: bool = False
+        self.shift_label: str = "off"
+        self.preferred_shift: str = "day"
+        self.rotation_offset: int = 0
+        self.days_off_until_day: int | None = None
+        self.mask_compliant: bool = False
+
+        self.epi_state: str = "S"
+        self.is_infectious: bool = False
+        self.is_symptomatic: bool = False
+        self.is_detected: bool = False
+        self.is_isolated: bool = False
+
+        self.infection_tick: int | None = None
+        self.infected_by: str | None = None
+
+        self.latent_until_tick: int | None = None
+        self.presymptomatic_until_tick: int | None = None
+        self.recovery_tick: int | None = None
+        self.death_tick: int | None = None                
 
     def step(self):
+        self.model._update_staff_infection_state(self)
+
+        if not self.is_on_shift:
+            self.current_state = "off_shift"
+            return
+
         time_min = self.model.get_current_time_min()
         tick = self.model.current_tick
 
@@ -655,7 +762,10 @@ class DoctorAgent(BaseHospitalAgent):
         interactant_option = self.model.rng.choice(["doctor", "nurse"])
 
         if interactant_option == "doctor":
-            other_doctors = [d for d in self.model.doctors if d.unique_id != self.unique_id]
+            other_doctors = [
+                d for d in self.model.doctors
+                if d.unique_id != self.unique_id and d.is_on_shift
+            ]
             if other_doctors:
                 other = self.model.rng.choice(other_doctors)
                 if not self.model.is_recent_contact(self.unique_id, other.unique_id, tick, window_ticks=5):
@@ -667,8 +777,9 @@ class DoctorAgent(BaseHospitalAgent):
                     )
                     self.handover_initiated_this_block = True
         else:
-            if self.model.nurses:
-                nurse = self.model.rng.choice(self.model.nurses)
+            on_shift_nurses = [n for n in self.model.nurses if n.is_on_shift]
+            if on_shift_nurses:
+                nurse = self.model.rng.choice(on_shift_nurses)
                 if not self.model.is_recent_contact(self.unique_id, nurse.unique_id, tick, window_ticks=5):
                     self.model.record_contact(
                         tick=tick,
@@ -731,7 +842,13 @@ class HospitalContactModel(Model):
         self.state_snapshot_log: list[dict] = []
         self.seed_events: list[dict] = []
         self._scheduled_seed_introductions: list[dict] = []
+
         self.total_infection_events_counter: int = 0
+        self.total_patient_infection_events_counter: int = 0
+        self.total_staff_infection_events_counter: int = 0
+        self.total_nurse_infection_events_counter: int = 0
+        self.total_doctor_infection_events_counter: int = 0
+        self.total_patient_death_events_counter: int = 0
 
         self._visit_csv_file = None
         self._visit_csv_writer = None
@@ -756,6 +873,7 @@ class HospitalContactModel(Model):
         self.total_admissions = 0
         self.total_discharges = 0
         self.daily_flow_log: list[dict] = []
+        self.daily_room_pressure_log: list[dict] = []
         self.daily_census_history: list[int] = []
         self._daily_admissions_counter: dict[int, int] = {}
         self._daily_discharges_counter: dict[int, int] = {}
@@ -767,7 +885,9 @@ class HospitalContactModel(Model):
             self._init_stream_writers()
 
         self._init_agents()
+        self._initialize_staff_mask_compliance()
         self._assign_patients_to_rooms_deterministic()
+        self._update_staff_shift_status()
         self._assign_nurse_room_caseloads()
         self._assign_doctor_panels()
         self._assign_daily_feeders()
@@ -831,9 +951,6 @@ class HospitalContactModel(Model):
             self._visit_csv_file.flush()
 
     def _write_infection_event(self, event: dict):
-        if event.get("new_state") in {"E_lat", "E_inf", "I_asym"}:
-            self.total_infection_events_counter += 1
-
         if self.stream_logs and self._infection_csv_writer is not None:
             self._infection_csv_writer.writerow(event)
             self._infection_csv_file.flush()
@@ -848,11 +965,11 @@ class HospitalContactModel(Model):
             self.flow_log.append(event)
     
     def _write_snapshot_event(self, event: dict):
+        self.state_snapshot_log.append(event)
+
         if self.stream_logs and self._snapshot_csv_writer is not None:
             self._snapshot_csv_writer.writerow(event)
             self._snapshot_csv_file.flush()
-        else:
-            self.state_snapshot_log.append(event)
     
     def _close_stream_writers(self):
         for handle_name in [
@@ -900,9 +1017,10 @@ class HospitalContactModel(Model):
     
 
     def _build_room_capacity_map(self) -> dict[str, int]:
-        assert len(ROOM_CAPACITY_SPEC) == self.config.n_rooms
-        return {f"room_{i}": cap for i, cap in enumerate(ROOM_CAPACITY_SPEC)}
-
+        return {
+            f"room_{i}": cap
+            for i, cap in enumerate(self.config.room_capacity_spec)
+        }
     def _init_agents(self):
         for i in range(self.config.n_patients):
             pid = f"patient_{i}"
@@ -921,13 +1039,118 @@ class HospitalContactModel(Model):
             d = DoctorAgent(self, did)
             self.doctors.append(d)
             self.agent_index[did] = d
+        self._initialize_staff_roster_groups()
 
-    # FIX 2:
-    # Nem használt paraméterek rendbetétele és LOS konzisztencia.
-    # Bevezetünk központi LOS mintavételt, hogy:
-    # - az inicializált betegek
-    # - és az új felvételek
-    # ugyanabból a deklarált logikából kapjanak tartózkodási időt.
+    def _initialize_staff_roster_groups(self):
+        def _assign_shift_pools(
+            staff_list: list[BaseHospitalAgent],
+            baseline_day: int,
+            baseline_night: int,
+        ):
+            total = len(staff_list)
+            if total == 0:
+                return
+
+            if total == 1:
+                staff_list[0].preferred_shift = "day"
+                staff_list[0].rotation_offset = 0
+                return
+
+            day_share = baseline_day / max(1, baseline_day + baseline_night)
+            n_day_pool = int(round(total * day_share))
+
+            n_day_pool = max(1, n_day_pool)
+            n_day_pool = min(total - 1, n_day_pool)
+
+            day_pool = staff_list[:n_day_pool]
+            night_pool = staff_list[n_day_pool:]
+
+            for idx, staff in enumerate(day_pool):
+                staff.preferred_shift = "day"
+                staff.rotation_offset = idx
+
+            for idx, staff in enumerate(night_pool):
+                staff.preferred_shift = "night"
+                staff.rotation_offset = idx
+
+        _assign_shift_pools(
+            self.nurses,
+            self.config.baseline_nurses_day,
+            self.config.baseline_nurses_night,
+        )
+        _assign_shift_pools(
+            self.doctors,
+            self.config.baseline_doctors_day,
+            self.config.baseline_doctors_night,
+        )
+
+    def _select_rotating_staff_for_shift(
+        self,
+        staff_list: list[BaseHospitalAgent],
+        shift_label: str,
+        required_n: int,
+    ) -> list[BaseHospitalAgent]:
+        current_day = self.get_current_day()
+
+        eligible = [
+            s for s in staff_list
+            if getattr(s, "preferred_shift", "day") == shift_label
+            and (
+                getattr(s, "days_off_until_day", None) is None
+                or current_day >= s.days_off_until_day
+            )
+        ]
+
+        if len(eligible) < required_n:
+            backups = [
+                s for s in staff_list
+                if s not in eligible
+                and (
+                    getattr(s, "days_off_until_day", None) is None
+                    or current_day >= s.days_off_until_day
+                )
+            ]
+            eligible.extend(backups)
+
+        if not eligible:
+            return []
+
+        eligible = sorted(eligible, key=lambda s: getattr(s, "rotation_offset", 0))
+
+        offset = current_day % len(eligible)
+        rotated = eligible[offset:] + eligible[:offset]
+
+        return rotated[:min(required_n, len(rotated))]
+
+    def _initialize_staff_mask_compliance(self):
+        all_staff = [*self.nurses, *self.doctors]
+
+        for staff in all_staff:
+            staff.mask_compliant = False
+
+        if self.config.mask_strategy == "random":
+            for staff in all_staff:
+                staff.mask_compliant = self.rng.random() < self.config.mask_compliance_hcw
+            return
+
+        if self.config.mask_strategy == "targeted_ids":
+            targeted_ids = {
+                item.strip()
+                for item in self.config.targeted_mask_hcw_ids.split(",")
+                if item.strip()
+            }
+
+            for staff in all_staff:
+                if staff.unique_id in targeted_ids:
+                    staff.mask_compliant = True
+            return
+
+        raise ValueError(
+            f"Unsupported mask_strategy='{self.config.mask_strategy}'. "
+            "Allowed values: 'random', 'targeted_ids'."
+        )
+
+
     def _sample_los_days(self, distribution_name: str | None = None) -> int:
         dist = distribution_name or self.config.los_distribution
 
@@ -942,8 +1165,31 @@ class HospitalContactModel(Model):
             sampled = int(round(self.rng.expovariate(1.0 / mean)))
             return max(1, sampled)
 
-        # fallback: konzervatív viselkedés
+        if dist == "gamma":
+            mean = max(1e-9, float(self.config.mean_los_days))
+            shape = max(1e-9, float(self.config.los_gamma_shape))
+            scale = mean / shape
+
+            sampled = int(round(self.rng.gammavariate(shape, scale)))
+            sampled = max(self.config.los_min_days, sampled)
+            sampled = min(self.config.los_max_days, sampled)
+            return sampled
+
         return max(1, int(round(self.config.mean_los_days)))
+    
+    def _sample_initial_remaining_los_days(self) -> int:
+        dist = self.config.initial_remaining_los_distribution
+
+        if dist == "random_point_in_stay":
+            full_los = self._sample_los_days(self.config.los_distribution)
+
+            # A szimuláció kezdetén a beteg már valahol a teljes tartózkodási idején belül jár.
+            elapsed_days = self.rng.randint(0, max(0, full_los - 1))
+            remaining_los = full_los - elapsed_days
+
+            return max(1, remaining_los)
+
+        return self._sample_los_days(dist)
 
     def _assign_patients_to_rooms_deterministic(self):
         initial_n = self.config.initial_patient_count
@@ -953,10 +1199,7 @@ class HospitalContactModel(Model):
             p.is_active = True
             p.admission_day = 0
 
-            # FIX 3:
-            # korábban hardcode randint(1, 8) volt.
-            # most a deklarált initial_remaining_los_distribution paramétert használjuk.
-            p.remaining_los_days = self._sample_los_days(self.config.initial_remaining_los_distribution)
+            p.remaining_los_days = self._sample_initial_remaining_los_days()
 
         patient_iter = iter(active_patients)
         for room_id, capacity in self.room_capacity_map.items():
@@ -972,30 +1215,59 @@ class HospitalContactModel(Model):
         for nurse in self.nurses:
             nurse.caseload_rooms = []
 
+        active_nurses = [n for n in self.nurses if n.is_on_shift]
+        if not active_nurses:
+            return
+
         room_ids = sorted(self.room_capacity_map.keys(), key=lambda x: int(x.split("_")[1]))
         occupied_rooms = [rid for rid in room_ids if len(self.room_occupants[rid]) > 0]
 
         for i, room_id in enumerate(occupied_rooms):
-            nurse = self.nurses[i % len(self.nurses)]
+            nurse = active_nurses[i % len(active_nurses)]
             nurse.caseload_rooms.append(room_id)
 
     def _assign_doctor_panels(self):
         for doctor in self.doctors:
             doctor.panel_patients = []
 
+        active_doctors = [d for d in self.doctors if d.is_on_shift]
+        if not active_doctors:
+            return
+
         active_patient_ids = [p.unique_id for p in self.patients if p.is_active]
         for i, pid in enumerate(active_patient_ids):
-            doctor = self.doctors[i % len(self.doctors)]
+            doctor = active_doctors[i % len(active_doctors)]
             doctor.panel_patients.append(pid)
 
     def _assign_daily_feeders(self):
         for nurse in self.nurses:
             nurse.is_active_feeder = False
 
-        k = min(2, len(self.nurses))
-        feeder_indices = self.rng.sample(range(len(self.nurses)), k=k)
-        for i, nurse in enumerate(self.nurses):
-            nurse.is_active_feeder = i in feeder_indices
+        active_nurses = [n for n in self.nurses if n.is_on_shift]
+        if not active_nurses:
+            return
+
+        k = min(2, len(active_nurses))
+        selected = self.rng.sample(active_nurses, k=k)
+        for nurse in selected:
+            nurse.is_active_feeder = True
+
+    def _apply_staff_off_shift_community_exposure(self):
+        p_daily = self.config.staff_off_shift_community_exposure_per_day
+        if p_daily <= 0:
+            return
+
+        for staff in [*self.nurses, *self.doctors]:
+            if getattr(staff, "epi_state", None) != "S":
+                continue
+
+            if self.rng.random() < p_daily:
+                self._infect_staff_from_contact(
+                    staff,
+                    source_id="community",
+                    source_type="external",
+                    event_type="community_exposure",
+                )
 
     def _sample_random_nurse_station_ticks(self) -> set[int]:
         daytime_tick_start = AD_HOC_BLOCK[0] // self.config.dt_min
@@ -1019,6 +1291,57 @@ class HospitalContactModel(Model):
 
     def get_global_hour(self) -> int:
         return self.current_tick // (60 // self.config.dt_min)
+    
+    def _is_day_shift_hour(self, hour: int) -> bool:
+        return 7 <= hour < 19
+
+    def _get_current_shift_label(self) -> str:
+        return "day" if self._is_day_shift_hour(self.get_current_hour()) else "night"
+
+    def _update_staff_shift_status(self):
+        shift_label = self._get_current_shift_label()
+
+        if self.get_current_hour() == 0 and self.current_time_min == 0:
+            self._apply_staff_off_shift_community_exposure()
+
+        for nurse in self.nurses:
+            nurse.is_on_shift = False
+            nurse.shift_label = "off"
+
+        for doctor in self.doctors:
+            doctor.is_on_shift = False
+            doctor.shift_label = "off"
+
+        if shift_label == "day":
+            active_nurses = self._select_rotating_staff_for_shift(
+                self.nurses,
+                "day",
+                self.config.baseline_nurses_day,
+            )
+            active_doctors = self._select_rotating_staff_for_shift(
+                self.doctors,
+                "day",
+                self.config.baseline_doctors_day,
+            )
+        else:
+            active_nurses = self._select_rotating_staff_for_shift(
+                self.nurses,
+                "night",
+                self.config.baseline_nurses_night,
+            )
+            active_doctors = self._select_rotating_staff_for_shift(
+                self.doctors,
+                "night",
+                self.config.baseline_doctors_night,
+            )
+
+        for nurse in active_nurses:
+            nurse.is_on_shift = True
+            nurse.shift_label = shift_label
+
+        for doctor in active_doctors:
+            doctor.is_on_shift = True
+            doctor.shift_label = shift_label
 
     def _sample_discharge_hour(self) -> int:
         hours = [8, 9, 10, 11, 12, 13, 14, 15, 16]
@@ -1062,6 +1385,52 @@ class HospitalContactModel(Model):
         if census_changed:
             self._refresh_assignments_after_census_change()
 
+    def _record_daily_room_colonization_pressure(self, completed_day: int):
+        for room_id, patient_ids in self.room_occupants.items():
+            active_patients = [
+                self.agent_index[pid]
+                for pid in patient_ids
+                if isinstance(self.agent_index.get(pid), PatientAgent)
+                and self.agent_index[pid].is_active
+            ]
+
+            susceptible_count = sum(
+                1 for p in active_patients
+                if p.epi_state == "S"
+            )
+
+            infectious_count = sum(
+                1 for p in active_patients
+                if p.epi_state in {"E_inf", "I_asym", "I_sym"}
+            )
+
+            colonized_or_infected_count = sum(
+                1 for p in active_patients
+                if p.epi_state in {"E_lat", "E_inf", "I_asym", "I_sym", "R"}
+            )
+
+            if susceptible_count > 0:
+                infectious_pressure = infectious_count / susceptible_count
+                colonization_pressure = colonized_or_infected_count / susceptible_count
+            else:
+                infectious_pressure = None
+                colonization_pressure = None
+
+            self.daily_room_pressure_log.append(
+                {
+                    "run_id": self.config.run_id,
+                    "day": int(completed_day),
+                    "room_id": room_id,
+                    "room_capacity": int(self.room_capacity_map[room_id]),
+                    "active_patient_count": int(len(active_patients)),
+                    "susceptible_patient_count": int(susceptible_count),
+                    "infectious_patient_count": int(infectious_count),
+                    "colonized_or_infected_patient_count": int(colonized_or_infected_count),
+                    "infectious_pressure": infectious_pressure,
+                    "colonization_pressure": colonization_pressure,
+                }
+            )
+    
     def _finalize_previous_day_logs(self, completed_day: int):
         if completed_day < 0:
             return
@@ -1083,6 +1452,8 @@ class HospitalContactModel(Model):
             }
         )
 
+        self._record_daily_room_colonization_pressure(completed_day)
+
     def get_patients_in_room(self, room_id: str) -> list[str]:
         return self.room_occupants.get(room_id, [])
 
@@ -1102,22 +1473,22 @@ class HospitalContactModel(Model):
             p *= self.rng.random()
         return k - 1
 
-def _find_first_available_bed(self) -> str | None:
-    candidate_rooms = []
+    def _find_first_available_bed(self) -> str | None:
+        candidate_rooms = []
 
-    for room_id, capacity in self.room_capacity_map.items():
-        occupied = len(self.room_occupants[room_id])
-        if occupied < capacity:
-            occupancy_ratio = occupied / capacity
-            candidate_rooms.append((room_id, occupancy_ratio))
+        for room_id, capacity in self.room_capacity_map.items():
+            occupied = len(self.room_occupants[room_id])
+            if occupied < capacity:
+                occupancy_ratio = occupied / capacity
+                candidate_rooms.append((room_id, occupancy_ratio))
 
-    if not candidate_rooms:
-        return None
+        if not candidate_rooms:
+            return None
 
-    min_ratio = min(ratio for _, ratio in candidate_rooms)
-    best_rooms = [room_id for room_id, ratio in candidate_rooms if ratio == min_ratio]
+        min_ratio = min(ratio for _, ratio in candidate_rooms)
+        best_rooms = [room_id for room_id, ratio in candidate_rooms if ratio == min_ratio]
 
-    return self.rng.choice(best_rooms)
+        return self.rng.choice(best_rooms)
 
     def _get_inactive_patients_pool(self) -> list[PatientAgent]:
         return [p for p in self.patients if not p.is_active]
@@ -1155,10 +1526,21 @@ def _find_first_available_bed(self) -> str | None:
         patient.is_active = True
         patient.room_id = room_id
         patient.admission_day = self.get_current_day()
-
-        # FIX 4:
-        # korábban fix 8 nap volt, most a deklarált LOS logikát használjuk.
         patient.remaining_los_days = self._sample_los_days(self.config.los_distribution)
+
+        # Az új felvétel új betegként jelenik meg a modellben.
+        patient.epi_state = "S"
+        patient.is_infectious = False
+        patient.is_symptomatic = False
+        patient.is_detected = False
+        patient.is_isolated = False
+
+        patient.infected_by = None
+        patient.infection_tick = None
+        patient.latent_until_tick = None
+        patient.presymptomatic_until_tick = None
+        patient.recovery_tick = None
+        patient.death_tick = None
 
         self.room_occupants[room_id].append(patient.unique_id)
         self.total_admissions += 1
@@ -1277,9 +1659,6 @@ def _find_first_available_bed(self) -> str | None:
     ):
         actor = self.agent_index[actor_id]
         target = self.agent_index[target_id]
-
-        # FIX 7:
-        # egységes abszolút időkezelés
         time_min = tick_to_time_min(tick, self.config.dt_min)
 
         if target.agent_type == "patient":
@@ -1450,6 +1829,9 @@ def _find_first_available_bed(self) -> str | None:
             "event_type": "forced_seed",
             "new_state": seed_state,
         }
+        self.total_infection_events_counter += 1
+        self.total_patient_infection_events_counter += 1
+
         self._write_infection_event(event)
         self.seed_events.append(event)
 
@@ -1487,8 +1869,7 @@ def _find_first_available_bed(self) -> str | None:
             )
 
         self._scheduled_seed_introductions.sort(key=lambda x: x["seed_tick"])
-        print("SCHEDULED SEEDS:", self._scheduled_seed_introductions)
-
+ 
     def _apply_scheduled_seed_introductions(self):
         if not self._scheduled_seed_introductions:
             return
@@ -1512,26 +1893,18 @@ def _find_first_available_bed(self) -> str | None:
     def _is_staff_agent(self, agent: BaseHospitalAgent) -> bool:
         return isinstance(agent, (NurseAgent, DoctorAgent))
 
+    def _is_staff_susceptible(self, agent: BaseHospitalAgent) -> bool:
+        return self._is_staff_agent(agent) and getattr(agent, "epi_state", None) == "S"
+
+    def _is_staff_infectious(self, agent: BaseHospitalAgent) -> bool:
+        return self._is_staff_agent(agent) and getattr(agent, "is_infectious", False) is True
+
     def _is_patient_susceptible(self, agent: BaseHospitalAgent) -> bool:
         return isinstance(agent, PatientAgent) and agent.is_active and agent.epi_state == "S"
 
     def _is_patient_infectious(self, agent: BaseHospitalAgent) -> bool:
         return isinstance(agent, PatientAgent) and agent.is_active and agent.epi_state in {"E_inf", "I_asym", "I_sym"}
 
-    def _is_staff_contaminated(self, staff: BaseHospitalAgent) -> bool:
-        if not self._is_staff_agent(staff):
-            return False
-        return staff.contaminated_until_tick is not None and self.current_tick < staff.contaminated_until_tick
-
-    def _clear_staff_contamination(self, staff: BaseHospitalAgent):
-        if self._is_staff_agent(staff):
-            staff.contaminated_until_tick = None
-
-    def _contaminate_staff(self, staff: BaseHospitalAgent):
-        if not self._is_staff_agent(staff):
-            return
-        duration_ticks = days_to_ticks(self.config.hcw_contamination_duration_days, self.config.dt_min)
-        staff.contaminated_until_tick = self.current_tick + duration_ticks
 
     def _get_infectiousness_multiplier(self, patient: PatientAgent) -> float:
         if patient.epi_state == "E_inf":
@@ -1597,6 +1970,65 @@ def _find_first_available_bed(self) -> str | None:
             "event_type": "new_exposure",
             "new_state": "E_lat",
         }
+        self.total_infection_events_counter += 1
+        self.total_patient_infection_events_counter += 1
+
+        self._write_infection_event(event)
+
+    def _infect_staff_from_contact(
+        self,
+        staff: BaseHospitalAgent,
+        source_id: str,
+        source_type: str,
+        event_type: str,
+    ):
+        if not self._is_staff_agent(staff):
+            return
+        if getattr(staff, "epi_state", None) != "S":
+            return
+
+        staff.epi_state = "E_lat"
+        staff.is_infectious = False
+        staff.is_symptomatic = False
+        staff.is_detected = False
+        staff.is_isolated = False
+
+        staff.infection_tick = self.current_tick
+        staff.infected_by = source_id
+
+        latent_days = sample_gamma_days(
+            self.rng,
+            self.config.latent_shape,
+            self.config.latent_scale_days,
+        )
+        staff.latent_until_tick = self.current_tick + days_to_ticks(
+            latent_days,
+            self.config.dt_min,
+        )
+        staff.presymptomatic_until_tick = None
+        staff.recovery_tick = None
+        staff.death_tick = None
+
+        event = {
+            "run_id": self.config.run_id,
+            "tick": self.current_tick,
+            "day": self.get_current_day(),
+            "time_min": self.current_time_min,
+            "time_str": minute_to_clock_string(self.current_time_min),
+            "patient_id": staff.unique_id,
+            "source_id": source_id,
+            "source_type": source_type,
+            "event_type": f"staff_{event_type}",
+            "new_state": "E_lat",
+        }
+        self.total_infection_events_counter += 1
+        self.total_staff_infection_events_counter += 1
+
+        if isinstance(staff, NurseAgent):
+            self.total_nurse_infection_events_counter += 1
+        elif isinstance(staff, DoctorAgent):
+            self.total_doctor_infection_events_counter += 1
+
         self._write_infection_event(event)
 
     def _update_patient_infection_state(self, patient: PatientAgent):
@@ -1619,6 +2051,27 @@ def _find_first_available_bed(self) -> str | None:
 
             if patient.recovery_tick is not None and tick >= patient.recovery_tick:
                 self._process_patient_recovery(patient)
+                return
+   
+    def _update_staff_infection_state(self, staff: BaseHospitalAgent):
+        if not self._is_staff_agent(staff):
+            return
+
+        tick = self.current_tick
+
+        if staff.epi_state == "E_lat":
+            if staff.latent_until_tick is not None and tick >= staff.latent_until_tick:
+                self._progress_staff_e_lat_to_e_inf(staff)
+                return
+
+        if staff.epi_state == "E_inf":
+            if staff.presymptomatic_until_tick is not None and tick >= staff.presymptomatic_until_tick:
+                self._progress_staff_e_inf_to_i_state(staff)
+                return
+
+        if staff.epi_state in {"I_asym", "I_sym"}:
+            if staff.recovery_tick is not None and tick >= staff.recovery_tick:
+                self._process_staff_recovery(staff)
                 return
 
     def _progress_e_lat_to_e_inf(self, patient: PatientAgent):
@@ -1656,6 +2109,119 @@ def _find_first_available_bed(self) -> str | None:
         }
         self._write_infection_event(event)
 
+    def _progress_staff_e_lat_to_e_inf(self, staff: BaseHospitalAgent):
+        if not self._is_staff_agent(staff):
+            return
+        if staff.epi_state != "E_lat":
+            return
+
+        staff.epi_state = "E_inf"
+        staff.is_infectious = True
+        staff.is_symptomatic = False
+        staff.latent_until_tick = None
+
+        presymptomatic_days = sample_gamma_days(
+            self.rng,
+            self.config.presymptomatic_shape,
+            self.config.presymptomatic_scale_days,
+        )
+        staff.presymptomatic_until_tick = self.current_tick + days_to_ticks(
+            presymptomatic_days,
+            self.config.dt_min,
+        )
+
+        event = {
+            "run_id": self.config.run_id,
+            "tick": self.current_tick,
+            "day": self.get_current_day(),
+            "time_min": self.current_time_min,
+            "time_str": minute_to_clock_string(self.current_time_min),
+            "patient_id": staff.unique_id,
+            "source_id": staff.unique_id,
+            "source_type": "self_progression",
+            "event_type": "staff_progression",
+            "new_state": "E_inf",
+        }
+        self._write_infection_event(event)
+
+    def _progress_staff_e_inf_to_i_state(self, staff: BaseHospitalAgent):
+        if not self._is_staff_agent(staff):
+            return
+        if staff.epi_state != "E_inf":
+            return
+
+        staff.presymptomatic_until_tick = None
+
+        symptomatic = self.rng.random() < self.config.p_symptomatic
+
+        if symptomatic:
+            staff.epi_state = "I_sym"
+            staff.is_infectious = True
+            staff.is_symptomatic = True
+
+            recovery_days = max(
+                3.0,
+                sample_gamma_days(
+                    self.rng,
+                    self.config.recovery_sym_shape,
+                    self.config.recovery_sym_scale_days,
+                )
+            )
+            staff.recovery_tick = self.current_tick + days_to_ticks(
+                recovery_days,
+                self.config.dt_min,
+            )
+
+            if self.rng.random() < self.config.staff_symptomatic_stay_home_probability:
+                staff.days_off_until_day = self.get_current_day() + self.config.staff_symptomatic_off_duty_days
+            else:
+                staff.days_off_until_day = None
+
+            new_state = "I_sym"
+        else:
+            staff.epi_state = "I_asym"
+            staff.is_infectious = True
+            staff.is_symptomatic = False
+
+            recovery_days = max(
+                2.0,
+                sample_gamma_days(
+                    self.rng,
+                    self.config.recovery_asym_shape,
+                    self.config.recovery_asym_scale_days,
+                )
+            )
+            staff.recovery_tick = self.current_tick + days_to_ticks(
+                recovery_days,
+                self.config.dt_min,
+            )
+            new_state = "I_asym"
+
+        event = {
+            "run_id": self.config.run_id,
+            "tick": self.current_tick,
+            "day": self.get_current_day(),
+            "time_min": self.current_time_min,
+            "time_str": minute_to_clock_string(self.current_time_min),
+            "patient_id": staff.unique_id,
+            "source_id": staff.unique_id,
+            "source_type": "self_progression",
+            "event_type": "staff_progression",
+            "new_state": new_state,
+        }
+        self._write_infection_event(event)
+
+    def _process_staff_recovery(self, staff: BaseHospitalAgent):
+        if not self._is_staff_agent(staff):
+            return
+
+        staff.epi_state = "R"
+        staff.is_infectious = False
+        staff.is_symptomatic = False
+        staff.recovery_tick = None
+        staff.latent_until_tick = None
+        staff.presymptomatic_until_tick = None    
+    
     def _progress_e_inf_to_i_state(self, patient: PatientAgent):
         if not patient.is_active or patient.epi_state != "E_inf":
             return
@@ -1775,6 +2341,8 @@ def _find_first_available_bed(self) -> str | None:
             "event_type": "death",
             "new_state": "D",
         }
+        self.total_patient_death_events_counter += 1
+
         self._write_infection_event(event)
 
         self._discharge_patient(patient)
@@ -1832,51 +2400,124 @@ def _find_first_available_bed(self) -> str | None:
                     )
             return
 
-        # staff-patient contact via transient staff contamination
+        # direct staff-patient transmission with mask effect
         if self._is_staff_agent(actor) and isinstance(target, PatientAgent):
             staff = actor
             patient = target
 
-            # infectious patient contaminates staff
-            if self._is_patient_infectious(patient):
+            # infectious patient infects susceptible staff
+            if self._is_patient_infectious(patient) and self._is_staff_susceptible(staff):
                 infectiousness = self._get_infectiousness_multiplier(patient)
                 isolation_multiplier = self.config.isolation_transmission_multiplier if patient.is_isolated else 1.0
-                p_contam = self._get_effective_transmission_prob(
+
+                source_multiplier = 1.0
+                target_multiplier = 1.0
+
+                if getattr(staff, "mask_compliant", False):
+                    target_multiplier = self.config.mask_target_multiplier_hcw
+
+                p_staff = self._get_effective_transmission_prob(
                     self.config.beta_patient_to_hcw_per_5min,
                     duration_min,
                     infectiousness_multiplier=infectiousness,
-                    isolation_multiplier=isolation_multiplier,
+                    isolation_multiplier=isolation_multiplier * source_multiplier * target_multiplier,
                 )
-                if self.rng.random() < p_contam:
-                    self._contaminate_staff(staff)
 
-            # contaminated staff infects susceptible patient
-            elif self._is_staff_contaminated(staff) and self._is_patient_susceptible(patient):
+                if self.rng.random() < p_staff:
+                    self._infect_staff_from_contact(
+                        staff,
+                        source_id=patient.unique_id,
+                        source_type=patient.agent_type,
+                        event_type=event_type,
+                    )
+
+            # infectious staff infects susceptible patient
+            if self._is_staff_infectious(staff) and self._is_patient_susceptible(patient):
                 isolation_multiplier = self.config.isolation_transmission_multiplier if patient.is_isolated else 1.0
-                p_trans = self._get_effective_transmission_prob(
+
+                source_multiplier = 1.0
+                target_multiplier = 1.0
+
+                if getattr(staff, "mask_compliant", False):
+                    source_multiplier = self.config.mask_source_multiplier_hcw
+
+                p_patient = self._get_effective_transmission_prob(
                     self.config.beta_hcw_to_patient_per_5min,
                     duration_min,
-                    infectiousness_multiplier=1.0,
-                    isolation_multiplier=isolation_multiplier,
+                    infectiousness_multiplier=self.config.hcw_relative_infectiousness,
+                    isolation_multiplier=isolation_multiplier * source_multiplier * target_multiplier,
                 )
-                if self.rng.random() < p_trans:
+
+                if self.rng.random() < p_patient:
                     self._infect_patient_from_contact(
                         patient,
                         source_id=staff.unique_id,
                         source_type=staff.agent_type,
-                        event_type=event_type,
+                        event_type=f"staff_direct_{event_type}",
                     )
 
-            # hand hygiene can clear staff contamination after patient contact
-            if self._is_staff_contaminated(staff):
-                if self.rng.random() < self.config.hand_hygiene_clearance_prob_after_patient_contact:
-                    self._clear_staff_contamination(staff)
+        # staff-staff transmission
+        if self._is_staff_agent(actor) and self._is_staff_agent(target):
+
+            if self._is_staff_infectious(actor) and self._is_staff_susceptible(target):
+                source_multiplier = 1.0
+                target_multiplier = 1.0
+
+                if getattr(actor, "mask_compliant", False):
+                    source_multiplier = self.config.mask_source_multiplier_hcw
+                if getattr(target, "mask_compliant", False):
+                    target_multiplier = self.config.mask_target_multiplier_hcw
+
+                p = self._get_effective_transmission_prob(
+                    self.config.beta_hcw_hcw_per_5min,
+                    duration_min,
+                    infectiousness_multiplier=self.config.hcw_relative_infectiousness,
+                    isolation_multiplier=source_multiplier * target_multiplier,
+                )
+                if self.rng.random() < p:
+                    self._infect_staff_from_contact(
+                        target,
+                        source_id=actor.unique_id,
+                        source_type=actor.agent_type,
+                        event_type="staff_staff",
+                    )
+
+            elif self._is_staff_infectious(target) and self._is_staff_susceptible(actor):
+                source_multiplier = 1.0
+                target_multiplier = 1.0
+
+                if getattr(target, "mask_compliant", False):
+                    source_multiplier = self.config.mask_source_multiplier_hcw
+                if getattr(actor, "mask_compliant", False):
+                    target_multiplier = self.config.mask_target_multiplier_hcw
+
+                p = self._get_effective_transmission_prob(
+                    self.config.beta_hcw_hcw_per_5min,
+                    duration_min,
+                    infectiousness_multiplier=self.config.hcw_relative_infectiousness,
+                    isolation_multiplier=source_multiplier * target_multiplier,
+                )
+                if self.rng.random() < p:
+                    self._infect_staff_from_contact(
+                        actor,
+                        source_id=target.unique_id,
+                        source_type=target.agent_type,
+                        event_type="staff_staff",
+                    )
 
 
     # =========================================================
     # Model-level event generation
     # =========================================================
     def _generate_roommate_events(self, tick: int, _time_min: int):
+        interval_ticks = max(
+            1,
+            self.config.roommate_contact_interval_min // self.config.dt_min,
+        )
+
+        if tick % interval_ticks != 0:
+            return
+
         for room_id, occupants in self.room_occupants.items():
             active_occupants = [pid for pid in occupants if self.is_patient_active(pid)]
 
@@ -1893,7 +2534,7 @@ def _find_first_available_bed(self) -> str | None:
                         actor_id=p1,
                         target_id=p2,
                         event_type="roommate",
-                        duration_min=self.config.dt_min,
+                        duration_min=self.config.roommate_contact_interval_min,
                     )
 
     def _generate_nurse_station_events(self, tick: int, time_min: int):
@@ -1901,8 +2542,9 @@ def _find_first_available_bed(self) -> str | None:
         if not is_random_daytime_tick:
             return
 
-        if self.rng.random() < 0.3 and len(self.nurses) >= 2:
-            n1, n2 = self.rng.sample(self.nurses, k=2)
+        on_shift_nurses = [n for n in self.nurses if n.is_on_shift]
+        if self.rng.random() < 0.3 and len(on_shift_nurses) >= 2:
+            n1, n2 = self.rng.sample(on_shift_nurses, k=2)
             if not self.is_recent_contact(n1.unique_id, n2.unique_id, tick, window_ticks=6):
                 self.record_contact(
                     tick=tick,
@@ -1922,7 +2564,9 @@ def _find_first_available_bed(self) -> str | None:
         self.current_time_min = time_min
 
         if time_min % 60 == 0:
+            self._update_staff_shift_status()
             self._apply_scheduled_flow_for_current_hour()
+            self._refresh_assignments_after_census_change()
 
         self._apply_scheduled_seed_introductions()   
 
@@ -2070,15 +2714,14 @@ def run_single_simulation(
 
     metadata_path = export_run_metadata(config, run_output_dir)
 
-    analysis_paths = {}
-    if generate_figures:
-        analysis_paths = export_analysis_outputs(
-            config=config,
-            model=model,
-            agg_df=agg_df,
-            run_output_dir=run_output_dir,
-            generate_figures=generate_figures,
-        )
+
+    analysis_paths = export_analysis_outputs(
+        config=config,
+        model=model,
+        agg_df=agg_df,
+        run_output_dir=run_output_dir,
+        generate_figures=generate_figures,
+    )
 
     figure_paths: dict[str, str] = {}
     if generate_figures:
@@ -2117,12 +2760,63 @@ def build_run_summary(
     top5_degree: list[dict],
     total_infection_events: int,
 ) -> pd.DataFrame:
-    print("SUMMARY SEED EVENTS:", len(model.seed_events))
+    
     top5_degree_json = json.dumps(top5_degree, ensure_ascii=False)
+
+# =========================
+# EPIDEMIC METRICS
+# =========================
+
+    states_df = pd.DataFrame(model.state_snapshot_log)
+
+    if not states_df.empty:
+        states_df["I_total"] = states_df["I_asym"] + states_df["I_sym"]
+
+        peak_I = states_df["I_total"].max()
+
+        peak_row = states_df.loc[states_df["I_total"].idxmax()]
+        time_to_peak_day = peak_row["day"]
+        time_to_peak_tick = peak_row["tick"]
+
+        final_row = states_df.iloc[-1]
+
+        final_active_epidemic_burden = (
+            final_row["R"]
+            + final_row["I_asym"]
+            + final_row["I_sym"]
+            + final_row["E_lat"]
+            + final_row["E_inf"]
+        )
+    else:
+        peak_I = 0
+        time_to_peak_day = None
+        time_to_peak_tick = None
+        final_active_epidemic_burden = 0
 
     census_history = model.daily_census_history if model.daily_census_history else [model.get_current_patient_count()]
     occupancy_history = [c / config.n_patients for c in census_history]
 
+    all_staff = model.nurses + model.doctors
+
+    final_staff_S = sum(1 for a in all_staff if a.epi_state == "S")
+    final_staff_E_lat = sum(1 for a in all_staff if a.epi_state == "E_lat")
+    final_staff_E_inf = sum(1 for a in all_staff if a.epi_state == "E_inf")
+    final_staff_I_asym = sum(1 for a in all_staff if a.epi_state == "I_asym")
+    final_staff_I_sym = sum(1 for a in all_staff if a.epi_state == "I_sym")
+    final_staff_R = sum(1 for a in all_staff if a.epi_state == "R")
+    final_staff_D = sum(1 for a in all_staff if a.epi_state == "D")
+
+    final_staff_infected_total = (
+        final_staff_E_lat
+        + final_staff_E_inf
+        + final_staff_I_asym
+        + final_staff_I_sym
+        + final_staff_R
+        + final_staff_D
+    )
+
+    final_staff_active_infectious = final_staff_I_asym + final_staff_I_sym
+    
     summary = pd.DataFrame(
         [
             {
@@ -2135,7 +2829,11 @@ def build_run_summary(
                 "dt_min": config.dt_min,
                 "ticks_per_day": config.ticks_per_day,
                 "simulation_days": config.simulation_days,
+                "room_config_name": config.room_config_name,
                 "initial_patient_count": config.initial_patient_count,
+                "roommate_contact_interval_min": config.roommate_contact_interval_min,
+                "mask_strategy": config.mask_strategy,
+                "targeted_mask_hcw_ids": config.targeted_mask_hcw_ids,
                 "initial_seed_infections": config.initial_seed_infections,
                 "seed_in_first_days": config.seed_in_first_days,
                 "seed_state": config.seed_state,
@@ -2165,15 +2863,41 @@ def build_run_summary(
                 "total_NN_events": int(type_counts.get("NN", 0)),
                 "total_ND_events": int(type_counts.get("DN", 0)),
                 "total_DD_events": int(type_counts.get("DD", 0)),
+                "n_mask_compliant_nurses": int(sum(1 for n in model.nurses if getattr(n, "mask_compliant", False))),
+                "n_mask_compliant_doctors": int(sum(1 for d in model.doctors if getattr(d, "mask_compliant", False))),
                 "top5_nodes_by_degree": top5_degree_json,
-                "final_S": int(sum(1 for p in model.patients if p.epi_state == "S")),
-                "final_E_lat": int(sum(1 for p in model.patients if p.epi_state == "E_lat")),
-                "final_E_inf": int(sum(1 for p in model.patients if p.epi_state == "E_inf")),
-                "final_I_asym": int(sum(1 for p in model.patients if p.epi_state == "I_asym")),
-                "final_I_sym": int(sum(1 for p in model.patients if p.epi_state == "I_sym")),
-                "final_R": int(sum(1 for p in model.patients if p.epi_state == "R")),
-                "final_D": int(sum(1 for p in model.patients if p.epi_state == "D")),
+                "final_active_S": int(sum(1 for p in model.patients if p.is_active and p.epi_state == "S")),
+                "final_active_E_lat": int(sum(1 for p in model.patients if p.is_active and p.epi_state == "E_lat")),
+                "final_active_E_inf": int(sum(1 for p in model.patients if p.is_active and p.epi_state == "E_inf")),
+                "final_active_I_asym": int(sum(1 for p in model.patients if p.is_active and p.epi_state == "I_asym")),
+                "final_active_I_sym": int(sum(1 for p in model.patients if p.is_active and p.epi_state == "I_sym")),
+                "final_active_R": int(sum(1 for p in model.patients if p.is_active and p.epi_state == "R")),
+
+                "cumulative_patient_infections": int(model.total_patient_infection_events_counter),
+                "cumulative_staff_infections": int(model.total_staff_infection_events_counter),
+                "cumulative_nurse_infections": int(model.total_nurse_infection_events_counter),
+                "cumulative_doctor_infections": int(model.total_doctor_infection_events_counter),
+                "cumulative_patient_deaths": int(model.total_patient_death_events_counter),
                 "total_infection_events": int(total_infection_events),
+
+                # Epidemiological outcome metrics
+                # final_epidemic_size is defined as the cumulative number of patient infections
+                # during the run, including initially seeded patient infections.
+                "final_epidemic_size": int(model.total_patient_infection_events_counter),
+                "final_active_epidemic_burden": int(final_active_epidemic_burden),
+
+                "peak_I": int(peak_I),
+                "time_to_peak_day": time_to_peak_day,
+                "time_to_peak_tick": time_to_peak_tick,
+                "final_staff_S": final_staff_S,
+                "final_staff_E_lat": final_staff_E_lat,
+                "final_staff_E_inf": final_staff_E_inf,
+                "final_staff_I_asym": final_staff_I_asym,
+                "final_staff_I_sym": final_staff_I_sym,
+                "final_staff_R": final_staff_R,
+                "final_staff_D": final_staff_D,
+                "final_staff_active_infectious": final_staff_active_infectious,
+                "final_staff_infected_total": final_staff_infected_total,
             }
         ]
     )
@@ -2246,6 +2970,8 @@ def export_run_metadata(config: SimConfig, run_output_dir: str) -> str:
         "dt_min": config.dt_min,
         "ticks_per_day": config.ticks_per_day,
         "simulation_days": config.simulation_days,
+        "room_config_name": config.room_config_name,
+        "room_capacity_spec": config.room_capacity_spec,
         "ward_capacity": config.ward_capacity,
         "n_patients_capacity": config.n_patients,
         "n_nurses": config.n_nurses,
@@ -2256,6 +2982,9 @@ def export_run_metadata(config: SimConfig, run_output_dir: str) -> str:
         "mean_los_days": config.mean_los_days,
         "los_distribution": config.los_distribution,
         "initial_remaining_los_distribution": config.initial_remaining_los_distribution,
+        "los_gamma_shape": config.los_gamma_shape,
+        "los_min_days": config.los_min_days,
+        "los_max_days": config.los_max_days,
         "initial_seed_infections": config.initial_seed_infections,
         "seed_in_first_days": config.seed_in_first_days,
         "seed_state": config.seed_state,
@@ -2281,9 +3010,17 @@ def export_run_metadata(config: SimConfig, run_output_dir: str) -> str:
         "i_asym_relative_infectiousness": config.i_asym_relative_infectiousness,
         "i_sym_relative_infectiousness": config.i_sym_relative_infectiousness,
         "isolation_transmission_multiplier": config.isolation_transmission_multiplier,
-        "hcw_contamination_duration_days": config.hcw_contamination_duration_days,
-        "hand_hygiene_clearance_prob_after_patient_contact": config.hand_hygiene_clearance_prob_after_patient_contact,
-    }
+        "mask_strategy": config.mask_strategy,
+        "targeted_mask_hcw_ids": config.targeted_mask_hcw_ids,
+        "mask_compliance_hcw": config.mask_compliance_hcw,
+        "mask_source_multiplier_hcw": config.mask_source_multiplier_hcw,
+        "mask_target_multiplier_hcw": config.mask_target_multiplier_hcw,
+        "beta_hcw_hcw_per_5min": config.beta_hcw_hcw_per_5min,
+        "hcw_relative_infectiousness": config.hcw_relative_infectiousness,
+        "staff_symptomatic_stay_home_probability": config.staff_symptomatic_stay_home_probability,
+        "staff_symptomatic_off_duty_days": config.staff_symptomatic_off_duty_days,
+        "roommate_contact_interval_min": config.roommate_contact_interval_min,
+        }
 
     with open(metadata_path, "w", encoding="utf-8") as f:
         json.dump(metadata, f, indent=2)
@@ -2692,6 +3429,75 @@ def build_degree_tables(agg_df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFram
 
     return node_df, role_df
 
+def build_staff_patient_contact_table(visit_log_path: str) -> pd.DataFrame:
+    df = load_visit_log_df(visit_log_path)
+
+    columns = [
+        "staff_id",
+        "staff_type",
+        "unique_patient_contacts",
+        "total_patient_contact_events",
+        "is_high_mobility_hcw",
+    ]
+
+    if df.empty:
+        return pd.DataFrame(columns=columns)
+
+    staff_patient_rows = df[
+        (
+            df["actor_type"].isin(["nurse", "doctor"])
+            & (df["target_type"] == "patient")
+        )
+        | (
+            (df["actor_type"] == "patient")
+            & df["target_type"].isin(["nurse", "doctor"])
+        )
+    ].copy()
+
+    if staff_patient_rows.empty:
+        return pd.DataFrame(columns=columns)
+
+    def _staff_id(row):
+        if row["actor_type"] in {"nurse", "doctor"}:
+            return row["actor_id"]
+        return row["target_id"]
+
+    def _staff_type(row):
+        if row["actor_type"] in {"nurse", "doctor"}:
+            return row["actor_type"]
+        return row["target_type"]
+
+    def _patient_id(row):
+        if row["actor_type"] == "patient":
+            return row["actor_id"]
+        return row["target_id"]
+
+    staff_patient_rows["staff_id"] = staff_patient_rows.apply(_staff_id, axis=1)
+    staff_patient_rows["staff_type"] = staff_patient_rows.apply(_staff_type, axis=1)
+    staff_patient_rows["patient_id"] = staff_patient_rows.apply(_patient_id, axis=1)
+
+    result = (
+        staff_patient_rows
+        .groupby(["staff_id", "staff_type"], as_index=False)
+        .agg(
+            unique_patient_contacts=("patient_id", "nunique"),
+            total_patient_contact_events=("patient_id", "size"),
+        )
+        .sort_values(
+            ["unique_patient_contacts", "total_patient_contact_events"],
+            ascending=[False, False],
+        )
+        .reset_index(drop=True)
+    )
+
+    mean_unique_patient_contacts = result["unique_patient_contacts"].mean()
+    result["is_high_mobility_hcw"] = (
+        result["unique_patient_contacts"] > mean_unique_patient_contacts
+    )
+
+    return result[columns]
+
+
 def build_daily_flow_dataframe(model: HospitalContactModel) -> pd.DataFrame:
     if not model.daily_flow_log:
         return pd.DataFrame(
@@ -2706,6 +3512,25 @@ def build_daily_flow_dataframe(model: HospitalContactModel) -> pd.DataFrame:
 
     df = pd.DataFrame(model.daily_flow_log).sort_values("day").reset_index(drop=True)
     return df
+
+def build_daily_room_pressure_dataframe(model: HospitalContactModel) -> pd.DataFrame:
+    columns = [
+        "run_id",
+        "day",
+        "room_id",
+        "room_capacity",
+        "active_patient_count",
+        "susceptible_patient_count",
+        "infectious_patient_count",
+        "colonized_or_infected_patient_count",
+        "infectious_pressure",
+        "colonization_pressure",
+    ]
+
+    if not model.daily_room_pressure_log:
+        return pd.DataFrame(columns=columns)
+
+    return pd.DataFrame(model.daily_room_pressure_log)[columns]
 
 def plot_daily_events_analysis(ts_df: pd.DataFrame, out_path: str):
     plt.figure(figsize=(14, 6))
@@ -2851,7 +3676,9 @@ def export_analysis_outputs(
     ts_df = build_daily_timeseries_dataset(config, visit_log_path)
     role_pair_summary_df, role_pair_matrix_counts_df, role_pair_matrix_ratios_df = build_role_pair_tables(visit_log_path)
     degree_node_df, degree_role_df = build_degree_tables(agg_df)
-    daily_flow_df = build_daily_flow_dataframe(model)   
+    staff_patient_contacts_df = build_staff_patient_contact_table(visit_log_path)
+    daily_flow_df = build_daily_flow_dataframe(model)
+    daily_room_pressure_df = build_daily_room_pressure_dataframe(model)
     
     ts_path = os.path.join(run_output_dir, "timeseries_daily.csv")
     role_pair_summary_path = os.path.join(run_output_dir, "role_pair_summary.csv")
@@ -2859,7 +3686,9 @@ def export_analysis_outputs(
     role_pair_ratios_path = os.path.join(run_output_dir, "role_pair_matrix_ratios.csv")
     degree_node_path = os.path.join(run_output_dir, "degree_summary_by_node.csv")
     degree_role_path = os.path.join(run_output_dir, "degree_summary_by_role.csv")
+    staff_patient_contacts_path = os.path.join(run_output_dir, "staff_patient_contacts.csv")
     daily_flow_path = os.path.join(run_output_dir, "daily_flow.csv")
+    daily_room_pressure_path = os.path.join(run_output_dir, "daily_room_pressure.csv")
 
     ts_df.to_csv(ts_path, index=False)
     role_pair_summary_df.to_csv(role_pair_summary_path, index=False)
@@ -2867,7 +3696,9 @@ def export_analysis_outputs(
     role_pair_matrix_ratios_df.to_csv(role_pair_ratios_path, index=True)
     degree_node_df.to_csv(degree_node_path, index=False)
     degree_role_df.to_csv(degree_role_path, index=False)
+    staff_patient_contacts_df.to_csv(staff_patient_contacts_path, index=False)
     daily_flow_df.to_csv(daily_flow_path, index=False)
+    daily_room_pressure_df.to_csv(daily_room_pressure_path, index=False)
 
     result = {
         "timeseries_daily_csv": ts_path,
@@ -2876,7 +3707,9 @@ def export_analysis_outputs(
         "role_pair_matrix_ratios_csv": role_pair_ratios_path,
         "degree_summary_by_node_csv": degree_node_path,
         "degree_summary_by_role_csv": degree_role_path,
+        "staff_patient_contacts_csv": staff_patient_contacts_path,
         "daily_flow_csv": daily_flow_path,
+        "daily_room_pressure_csv": daily_room_pressure_path,
     }
 
     if generate_figures:
@@ -2926,6 +3759,44 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed-state", type=str, default="I_asym", choices=["E_lat", "E_inf", "I_asym"])
     parser.add_argument("--seed-start-hour", type=int, default=9)
     parser.add_argument("--seed-end-hour", type=int, default=9)
+
+    parser.add_argument("--mask-compliance-hcw", type=float, default=0.20)
+    parser.add_argument(
+        "--mask-strategy",
+        type=str,
+        default="random",
+        choices=["random", "targeted_ids"],
+    )
+    parser.add_argument(
+        "--targeted-mask-hcw-ids",
+        type=str,
+        default="",
+        help="Comma-separated staff IDs for targeted mask intervention, e.g. nurse_1,nurse_2,doctor_0",
+    )
+    parser.add_argument(
+        "--room-config",
+        type=str,
+        default="baseline",
+        choices=list(ROOM_CONFIGS.keys()),
+    )
+
+    parser.add_argument("--mean-los-days", type=float, default=7.69)
+    parser.add_argument(
+        "--los-distribution",
+        type=str,
+        default="gamma",
+        choices=["fixed", "gamma", "exponential"],
+    )
+    parser.add_argument(
+        "--initial-remaining-los-distribution",
+        type=str,
+        default="random_point_in_stay",
+        choices=["random_point_in_stay", "discrete_uniform_1_8", "fixed", "gamma", "exponential"],
+    )
+    parser.add_argument("--los-gamma-shape", type=float, default=2.0)
+    parser.add_argument("--los-min-days", type=int, default=1)
+    parser.add_argument("--los-max-days", type=int, default=30)
+    parser.add_argument("--roommate-contact-interval-min", type=int, default=120)
     return parser.parse_args()
 
 
@@ -2975,9 +3846,11 @@ def print_single_run_report(result: dict[str, object]):
     print(f"- {state_snapshot_path}")
     print(f"- {metadata_path}")
     print(f"- {analysis_paths['daily_flow_csv']}")
+    print(f"- {analysis_paths['daily_room_pressure_csv']}")
     print(f"- {analysis_paths['degree_summary_by_node_csv']}")
     print(f"- {analysis_paths['degree_summary_by_role_csv']}")
     print(f"- {analysis_paths['role_pair_matrix_counts_csv']}")
+    print(f"- {analysis_paths['staff_patient_contacts_csv']}")
     print(f"- {analysis_paths['role_pair_matrix_ratios_csv']}")
     print(f"- {analysis_paths['role_pair_summary_csv']}")
     print(f"- {analysis_paths['timeseries_daily_csv']}")
@@ -3006,22 +3879,47 @@ def main():
         config = SimConfig(
             seed=base_seed,
             run_id=run_id,
+            room_config_name=args.room_config,
             initial_seed_infections=args.initial_seed_infections,
             seed_in_first_days=args.seed_in_first_days,
             seed_state=args.seed_state,
             seed_start_hour=args.seed_start_hour,
             seed_end_hour=args.seed_end_hour,
-        )
+            mask_strategy=args.mask_strategy,
+            targeted_mask_hcw_ids=args.targeted_mask_hcw_ids,
+            mask_compliance_hcw=args.mask_compliance_hcw,
+            mean_los_days=args.mean_los_days,
+            los_distribution=args.los_distribution,
+            initial_remaining_los_distribution=args.initial_remaining_los_distribution,
+            los_gamma_shape=args.los_gamma_shape,
+            los_min_days=args.los_min_days,
+            los_max_days=args.los_max_days,
+            roommate_contact_interval_min=args.roommate_contact_interval_min,
+)
+        
         run_output_dir = ensure_unique_output_dir(
             build_run_output_dir(config.output_dir, config.run_id, config.seed)
         )
         print("RUN_OUTPUT_DIR:", run_output_dir)
-        print("SEED CONFIG:", {
+        print("RUN CONFIG:", {
+            "room_config_name": config.room_config_name,
+            "ward_capacity": config.ward_capacity,
+            "n_rooms": config.n_rooms,
+            "mask_strategy": config.mask_strategy,
+            "targeted_mask_hcw_ids": config.targeted_mask_hcw_ids,
             "initial_seed_infections": config.initial_seed_infections,
             "seed_in_first_days": config.seed_in_first_days,
             "seed_state": config.seed_state,
             "seed_start_hour": config.seed_start_hour,
             "seed_end_hour": config.seed_end_hour,
+            "mask_compliance_hcw": config.mask_compliance_hcw,
+            "mean_los_days": config.mean_los_days,
+            "los_distribution": config.los_distribution,
+            "initial_remaining_los_distribution": config.initial_remaining_los_distribution,
+            "los_gamma_shape": config.los_gamma_shape,
+            "los_min_days": config.los_min_days,
+            "los_max_days": config.los_max_days,
+            "roommate_contact_interval_min": config.roommate_contact_interval_min,
         })
 
         result = run_single_simulation(
@@ -3046,11 +3944,22 @@ def main():
         config = SimConfig(
             seed=seed,
             run_id=run_id,
+            room_config_name=args.room_config,
             initial_seed_infections=args.initial_seed_infections,
             seed_in_first_days=args.seed_in_first_days,
             seed_state=args.seed_state,
             seed_start_hour=args.seed_start_hour,
             seed_end_hour=args.seed_end_hour,
+            mask_strategy=args.mask_strategy,
+            targeted_mask_hcw_ids=args.targeted_mask_hcw_ids,
+            mask_compliance_hcw=args.mask_compliance_hcw,
+            mean_los_days=args.mean_los_days,
+            los_distribution=args.los_distribution,
+            initial_remaining_los_distribution=args.initial_remaining_los_distribution,
+            los_gamma_shape=args.los_gamma_shape,
+            los_min_days=args.los_min_days,
+            los_max_days=args.los_max_days,
+            roommate_contact_interval_min=args.roommate_contact_interval_min,
         )
         run_output_dir = ensure_unique_output_dir(
             build_batch_run_output_dir(batch_output_dir, run_number)
