@@ -109,8 +109,17 @@ class SimConfig:
     target_bed_occupancy: float = 0.6829
     mean_los_days: float = 7.69
     initial_patient_count: int = 57
+
+    # Betegáramlási referenciaértékek.
+    # A target_bed_occupancy országos éves átlagból becsült referencia,
+    # nem napi kemény kapacitáskorlát.
+    census_soft_lower: int = 50
+    census_soft_upper: int = 65
+    census_hard_upper: int = 83 # szükség esetén baseline 70
+
     los_distribution: str = "gamma"
     initial_remaining_los_distribution: str = "random_point_in_stay"
+
 
     los_gamma_shape: float = 2.0
     los_min_days: int = 1
@@ -125,9 +134,9 @@ class SimConfig:
     nurse_shift_times: str = "07:00-19:00"
     doctor_shift_times: str = "08:00-17:00"
     staff_rotation_mode: str = "cyclic_with_shift_pools"
-    staff_symptomatic_stay_home_probability: float = 1.0  # 1.0 minden tünetes kiesik, 0.0 senki nem esik ki, 0,4 például 40% esik ki
+    staff_symptomatic_stay_home_probability: float = 1.0  #realisztikusabb presenteeism-szcenárió 1.0 helyett 0.7  1.0 minden tünetes kiesik, 0.0 senki nem esik ki, 0,4 például 40% esik ki
     staff_off_shift_community_exposure_per_day: float = 0
-    staff_symptomatic_off_duty_days: int = 5
+    staff_symptomatic_off_duty_days: int = 10             # realisztikusabb presenteeism-szcenárió 10 helyett 5
 
     nurse_rounds_per_day: int = 3
     doctor_visits_per_patient_per_day: int = 1
@@ -167,11 +176,11 @@ class SimConfig:
 
     # E_lat duration
     latent_shape: float = 1.3521
-    latent_scale_days: float = 2.0
+    latent_scale_days: float = 1.10
 
     # E_inf duration (presymptomatic infectious period)
     presymptomatic_shape: float = 2.0
-    presymptomatic_scale_days: float = 1.5
+    presymptomatic_scale_days: float = 0.90
 
     # I_asym recovery
     recovery_asym_shape: float = 2.0
@@ -186,14 +195,14 @@ class SimConfig:
     death_scale_days: float = 3.6045
 
     # transmission probabilities per 5-minute contact interval
-    beta_patient_patient_per_5min: float = 0.015    # alternative sensitivity-analysis value: 0.002
-    beta_hcw_to_patient_per_5min: float = 0.03      # alternative sensitivity-analysis value: 0.008
-    beta_patient_to_hcw_per_5min: float = 0.03      # alternative sensitivity-analysis value: 0.008
+    beta_patient_patient_per_5min: float = 0.004    # alternative sensitivity-analysis value: 0.015
+    beta_hcw_to_patient_per_5min: float = 0.012     # alternative sensitivity-analysis value: 0.03
+    beta_patient_to_hcw_per_5min: float = 0.012     # alternative sensitivity-analysis value: 0.03
                                                     # Higher PP beta values increase the cumulative exposure effect during long roommate stays.
 
     # relative infectiousness by stage
-    e_inf_relative_infectiousness: float = 0.80
-    i_asym_relative_infectiousness: float = 0.60
+    e_inf_relative_infectiousness: float = 0.90
+    i_asym_relative_infectiousness: float = 0.75
     i_sym_relative_infectiousness: float = 1.00
 
     isolation_transmission_multiplier: float = 0.30
@@ -206,8 +215,8 @@ class SimConfig:
     mask_source_multiplier_hcw: float = 0.30
     mask_target_multiplier_hcw: float = 0.50
 
-    beta_hcw_hcw_per_5min: float = 0.01
-    hcw_relative_infectiousness: float = 0.80
+    beta_hcw_hcw_per_5min: float = 0.012
+    hcw_relative_infectiousness: float = 0.90
 
     def __post_init__(self):
         if self.room_config_name not in ROOM_CONFIGS:
@@ -1368,7 +1377,19 @@ class HospitalContactModel(Model):
                 census_changed = True
 
         admission_ids = self._scheduled_admissions_by_hour.pop(key, [])
+
+        hard_upper_census = min(
+            self.config.ward_capacity,
+            self.config.census_hard_upper,
+        )
+
         for patient_id in admission_ids:
+            # Az óránként végrehajtott felvételeknél kemény felső plafont alkalmazunk.
+            # Ez engedi a referencia-census körüli természetes ingadozást,
+            # de megakadályozza az irreális feltöltődési driftet.
+            if self.get_current_patient_count() >= hard_upper_census:
+                break
+
             patient = self.agent_index.get(patient_id)
             if not isinstance(patient, PatientAgent):
                 continue
@@ -1614,16 +1635,45 @@ class HospitalContactModel(Model):
         current_census = self.get_current_patient_count()
         projected_census_after_discharges = current_census - len(due_for_discharge)
 
-        target_gap = (
+        reference_census = int(round(
             self.config.target_bed_occupancy * self.config.ward_capacity
-        ) - projected_census_after_discharges
-        expected_admissions = max(0.0, target_gap)
+        ))
 
+        soft_lower_census = self.config.census_soft_lower
+        soft_upper_census = self.config.census_soft_upper
+        hard_upper_census = min(
+            self.config.ward_capacity,
+            self.config.census_hard_upper,
+        )
+
+        # A referencia-census nem kemény napi célérték, hanem hosszabb távú átlagos
+        # betegszám. A felvételi igény sávosan működik:
+        # - soft_lower alatt aktív visszatöltés történik,
+        # - soft_lower és soft_upper között mérsékelt, sztochasztikus felvétel lehetséges,
+        # - soft_upper fölött csak discharge-ok csökkentik a censust,
+        # - hard_upper fölé nem ütemezünk felvételt.
+        if projected_census_after_discharges < soft_lower_census:
+            expected_admissions = reference_census - projected_census_after_discharges
+        elif projected_census_after_discharges < reference_census:
+            expected_admissions = 0.75 * (reference_census - projected_census_after_discharges)
+        elif projected_census_after_discharges < soft_upper_census:
+            expected_admissions = 0.25 * (soft_upper_census - projected_census_after_discharges)
+        else:
+            expected_admissions = 0.0
+
+        expected_admissions = max(0.0, expected_admissions)
         daily_admissions = self._sample_poisson(expected_admissions)
 
-        available_beds_after_discharges = self.config.ward_capacity - projected_census_after_discharges
-        daily_admissions = min(daily_admissions, available_beds_after_discharges)
+        # A napi ütemezés legfeljebb a kemény felső plafonig enged felvételt.
+        max_admissions_today = max(0, hard_upper_census - projected_census_after_discharges)
 
+        available_beds_after_discharges = self.config.ward_capacity - projected_census_after_discharges
+
+        daily_admissions = min(
+            daily_admissions,
+            max_admissions_today,
+            available_beds_after_discharges,
+        )
         inactive_pool = self._get_inactive_patients_pool()
 
         self._scheduled_admissions_by_hour = {
@@ -2832,6 +2882,10 @@ def build_run_summary(
                 "room_config_name": config.room_config_name,
                 "initial_patient_count": config.initial_patient_count,
                 "roommate_contact_interval_min": config.roommate_contact_interval_min,
+                "beta_patient_patient_per_5min": config.beta_patient_patient_per_5min,
+                "beta_hcw_to_patient_per_5min": config.beta_hcw_to_patient_per_5min,
+                "beta_patient_to_hcw_per_5min": config.beta_patient_to_hcw_per_5min,
+                "beta_hcw_hcw_per_5min": config.beta_hcw_hcw_per_5min,
                 "mask_strategy": config.mask_strategy,
                 "targeted_mask_hcw_ids": config.targeted_mask_hcw_ids,
                 "initial_seed_infections": config.initial_seed_infections,
@@ -2980,6 +3034,9 @@ def export_run_metadata(config: SimConfig, run_output_dir: str) -> str:
         "initial_patient_count": config.initial_patient_count,
         "target_bed_occupancy": config.target_bed_occupancy,
         "mean_los_days": config.mean_los_days,
+        "census_soft_lower": config.census_soft_lower,
+        "census_soft_upper": config.census_soft_upper,
+        "census_hard_upper": config.census_hard_upper,
         "los_distribution": config.los_distribution,
         "initial_remaining_los_distribution": config.initial_remaining_los_distribution,
         "los_gamma_shape": config.los_gamma_shape,
@@ -3768,6 +3825,30 @@ def parse_args() -> argparse.Namespace:
         choices=["random", "targeted_ids"],
     )
     parser.add_argument(
+        "--beta-patient-patient-per-5min",
+        type=float,
+        default=SimConfig.beta_patient_patient_per_5min,
+        help="Transmission probability per 5-minute patient-patient contact.",
+    )
+    parser.add_argument(
+        "--beta-hcw-to-patient-per-5min",
+        type=float,
+        default=SimConfig.beta_hcw_to_patient_per_5min,
+        help="Transmission probability per 5-minute HCW-to-patient contact.",
+    )
+    parser.add_argument(
+        "--beta-patient-to-hcw-per-5min",
+        type=float,
+        default=SimConfig.beta_patient_to_hcw_per_5min,
+        help="Transmission probability per 5-minute patient-to-HCW contact.",
+    )
+    parser.add_argument(
+        "--beta-hcw-hcw-per-5min",
+        type=float,
+        default=SimConfig.beta_hcw_hcw_per_5min,
+        help="Transmission probability per 5-minute HCW-HCW contact.",
+    )
+    parser.add_argument(
         "--targeted-mask-hcw-ids",
         type=str,
         default="",
@@ -3895,7 +3976,11 @@ def main():
             los_min_days=args.los_min_days,
             los_max_days=args.los_max_days,
             roommate_contact_interval_min=args.roommate_contact_interval_min,
-)
+            beta_patient_patient_per_5min=args.beta_patient_patient_per_5min,
+            beta_hcw_to_patient_per_5min=args.beta_hcw_to_patient_per_5min,
+            beta_patient_to_hcw_per_5min=args.beta_patient_to_hcw_per_5min,
+            beta_hcw_hcw_per_5min=args.beta_hcw_hcw_per_5min,
+        )
         
         run_output_dir = ensure_unique_output_dir(
             build_run_output_dir(config.output_dir, config.run_id, config.seed)
@@ -3920,6 +4005,10 @@ def main():
             "los_min_days": config.los_min_days,
             "los_max_days": config.los_max_days,
             "roommate_contact_interval_min": config.roommate_contact_interval_min,
+            "beta_patient_patient_per_5min": config.beta_patient_patient_per_5min,
+            "beta_hcw_to_patient_per_5min": config.beta_hcw_to_patient_per_5min,
+            "beta_patient_to_hcw_per_5min": config.beta_patient_to_hcw_per_5min,
+            "beta_hcw_hcw_per_5min": config.beta_hcw_hcw_per_5min,
         })
 
         result = run_single_simulation(
@@ -3960,12 +4049,22 @@ def main():
             los_min_days=args.los_min_days,
             los_max_days=args.los_max_days,
             roommate_contact_interval_min=args.roommate_contact_interval_min,
+            beta_patient_patient_per_5min=args.beta_patient_patient_per_5min,
+            beta_hcw_to_patient_per_5min=args.beta_hcw_to_patient_per_5min,
+            beta_patient_to_hcw_per_5min=args.beta_patient_to_hcw_per_5min,
+            beta_hcw_hcw_per_5min=args.beta_hcw_hcw_per_5min,
         )
         run_output_dir = ensure_unique_output_dir(
             build_batch_run_output_dir(batch_output_dir, run_number)
         )
 
-        print(f"Starting run {run_number}/{args.n_runs} with seed {seed}")
+        print(
+            f"Starting run {run_number}/{args.n_runs} with seed {seed} | "
+            f"beta_PP={config.beta_patient_patient_per_5min}, "
+            f"beta_HCW_to_P={config.beta_hcw_to_patient_per_5min}, "
+            f"beta_P_to_HCW={config.beta_patient_to_hcw_per_5min}, "
+            f"beta_HCW_HCW={config.beta_hcw_hcw_per_5min}"
+        )
 
         try:
             result = run_single_simulation(
